@@ -13,6 +13,9 @@
     <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-supported-lightgrey" alt="macOS | Linux" />
   </p>
   <p>
+    <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+  </p>
+  <p>
     <a href="#核心特性">核心特性</a> ·
     <a href="#截图展示">截图展示</a> ·
     <a href="#工作原理">工作原理</a> ·
