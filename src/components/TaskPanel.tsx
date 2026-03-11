@@ -1,0 +1,912 @@
+import { Show, For, createSignal, createEffect, onMount, onCleanup } from 'solid-js';
+import { createStore } from 'solid-js/store';
+import { revealItemInDir } from '../lib/shell';
+import {
+  store,
+  retryCloseTask,
+  setActiveTask,
+  markAgentExited,
+  restartAgent,
+  updateTaskName,
+  spawnShellForTask,
+  closeShell,
+  setLastPrompt,
+  getProject,
+  reorderTask,
+  getFontScale,
+  getTaskDotStatus,
+  markAgentOutput,
+  registerFocusFn,
+  unregisterFocusFn,
+  setTaskFocusedPanel,
+  triggerFocus,
+  clearPendingAction,
+} from '../store/store';
+import { ResizablePanel, type PanelChild } from './ResizablePanel';
+import { EditableText, type EditableTextHandle } from './EditableText';
+import { IconButton } from './IconButton';
+import { InfoBar } from './InfoBar';
+import { StatusDot } from './StatusDot';
+import { TerminalView } from './TerminalView';
+import { ScalablePanel } from './ScalablePanel';
+import { TaskDialogs } from './TaskDialogs';
+import { EditProjectDialog } from './EditProjectDialog';
+import { theme } from '../lib/theme';
+import { sf } from '../lib/fontScale';
+import { mod } from '../lib/platform';
+import { extractLabel, consumePendingShellCommand } from '../lib/bookmarks';
+import { handleDragReorder } from '../lib/dragReorder';
+import type { Task } from '../store/types';
+import type { ChangedFile } from '../ipc/types';
+
+interface TaskPanelProps {
+  task: Task;
+  isActive: boolean;
+}
+
+export function TaskPanel(props: TaskPanelProps) {
+  const [showCloseConfirm, setShowCloseConfirm] = createSignal(false);
+  const [showMergeConfirm, setShowMergeConfirm] = createSignal(false);
+  const [showPushConfirm, setShowPushConfirm] = createSignal(false);
+  const [showBranchDialog, setShowBranchDialog] = createSignal(false);
+  const [showCommitDialog, setShowCommitDialog] = createSignal(false);
+  const [pushSuccess, setPushSuccess] = createSignal(false);
+  const [pushing, setPushing] = createSignal(false);
+  let pushSuccessTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(pushSuccessTimer));
+  const [diffFile, setDiffFile] = createSignal<ChangedFile | null>(null);
+  const [editingProjectId, setEditingProjectId] = createSignal<string | null>(null);
+  const [shellExits, setShellExits] = createStore<
+    Record<string, { exitCode: number | null; signal: string | null }>
+  >({});
+  let panelRef!: HTMLDivElement;
+  let shellToolbarRef: HTMLDivElement | undefined;
+  let titleEditHandle: EditableTextHandle | undefined;
+  const [shellToolbarIdx, setShellToolbarIdx] = createSignal(0);
+  const [shellToolbarFocused, setShellToolbarFocused] = createSignal(false);
+  const projectBookmarks = () => getProject(props.task.projectId)?.terminalBookmarks ?? [];
+  const editingProject = () => {
+    const id = editingProjectId();
+    return id ? (getProject(id) ?? null) : null;
+  };
+
+  // Focus registration for this task's panels
+  onMount(() => {
+    const id = props.task.id;
+    registerFocusFn(`${id}:title`, () => titleEditHandle?.startEdit());
+    registerFocusFn(`${id}:shell-toolbar`, () => shellToolbarRef?.focus());
+    // Individual shell:N and ai-terminal focus fns are registered via TerminalView.onReady
+
+    onCleanup(() => {
+      unregisterFocusFn(`${id}:title`);
+      unregisterFocusFn(`${id}:shell-toolbar`);
+      // Individual shell:N focus fns are cleaned up by their own onCleanup
+      unregisterFocusFn(`${id}:ai-terminal`);
+    });
+  });
+
+  // Respond to focus panel changes from store
+  createEffect(() => {
+    if (!props.isActive) return;
+    const panel = store.focusedPanel[props.task.id];
+    if (panel) {
+      triggerFocus(`${props.task.id}:${panel}`);
+    }
+  });
+
+  // Auto-focus AI terminal when task first becomes active (if no panel set yet)
+  createEffect(() => {
+    if (props.isActive && !store.focusedPanel[props.task.id]) {
+      const id = props.task.id;
+      setTimeout(() => {
+        // Only focus AI terminal if no panel was set in the meantime
+        if (!store.focusedPanel[id] && !panelRef.contains(document.activeElement)) {
+          setTaskFocusedPanel(id, 'ai-terminal');
+        }
+      }, 0);
+    }
+  });
+
+  // React to pendingAction from keyboard shortcuts
+  createEffect(() => {
+    const action = store.pendingAction;
+    if (!action || action.taskId !== props.task.id) return;
+    clearPendingAction();
+    switch (action.type) {
+      case 'close':
+        setShowCloseConfirm(true);
+        break;
+      case 'merge':
+        if (!props.task.directMode) openMergeConfirm();
+        break;
+      case 'push':
+        if (!props.task.directMode) setShowPushConfirm(true);
+        break;
+    }
+  });
+
+  function openMergeConfirm() {
+    setShowMergeConfirm(true);
+  }
+
+  const firstAgent = () => {
+    const ids = props.task.agentIds;
+    return ids.length > 0 ? store.agents[ids[0]] : undefined;
+  };
+
+  function handleTitleMouseDown(e: MouseEvent) {
+    handleDragReorder(e, {
+      itemId: props.task.id,
+      getTaskOrder: () => store.taskOrder,
+      onReorder: reorderTask,
+      onTap: () => setActiveTask(props.task.id),
+    });
+  }
+
+  function titleBar(): PanelChild {
+    return {
+      id: 'title',
+      initialSize: 50,
+      fixed: true,
+      content: () => (
+        <div
+          class={props.isActive ? 'island-header-active' : ''}
+          style={{
+            display: 'flex',
+            'align-items': 'center',
+            'justify-content': 'space-between',
+            padding: '0 10px',
+            height: '100%',
+            background: 'transparent',
+            'border-bottom': `1px solid ${theme.border}`,
+            'user-select': 'none',
+            cursor: 'grab',
+          }}
+          onMouseDown={handleTitleMouseDown}
+        >
+          <div
+            style={{
+              overflow: 'hidden',
+              flex: '1',
+              'min-width': '0',
+              display: 'flex',
+              'align-items': 'center',
+              gap: '8px',
+            }}
+          >
+            <StatusDot status={getTaskDotStatus(props.task.id)} size="md" />
+            <Show when={props.task.directMode}>
+              <span
+                style={{
+                  'font-size': '11px',
+                  'font-weight': '600',
+                  padding: '2px 8px',
+                  'border-radius': '4px',
+                  background: `color-mix(in srgb, ${theme.warning} 15%, transparent)`,
+                  color: theme.warning,
+                  border: `1px solid color-mix(in srgb, ${theme.warning} 25%, transparent)`,
+                  'flex-shrink': '0',
+                  'white-space': 'nowrap',
+                }}
+              >
+                {props.task.branchName}
+              </span>
+            </Show>
+            <EditableText
+              value={props.task.name}
+              onCommit={(v) => updateTaskName(props.task.id, v)}
+              class="editable-text"
+              title={props.task.savedInitialPrompt}
+              ref={(h) => (titleEditHandle = h)}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: '4px', 'margin-left': '8px', 'flex-shrink': '0' }}>
+            <IconButton
+              icon={
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm6.25 7.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 7.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm0 0h5.5a2.5 2.5 0 0 0 2.5-2.5v-.5a.75.75 0 0 0-1.5 0v.5a1 1 0 0 1-1 1H5a3.25 3.25 0 1 0 0 6.5h6.25a.75.75 0 0 0 0-1.5H5a1.75 1.75 0 1 1 0-3.5Z" />
+                </svg>
+              }
+              onClick={() => setShowBranchDialog(true)}
+              title="切换或创建分支"
+            />
+            <IconButton
+              icon={
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M3.75 2A1.75 1.75 0 0 0 2 3.75v8.5C2 13.216 2.784 14 3.75 14h8.5A1.75 1.75 0 0 0 14 12.25v-5a.75.75 0 0 0-1.5 0v5a.25.25 0 0 1-.25.25h-8.5a.25.25 0 0 1-.25-.25v-8.5a.25.25 0 0 1 .25-.25h5a.75.75 0 0 0 0-1.5h-5Zm9.78.22a.75.75 0 0 1 0 1.06L8.56 8.25a.75.75 0 0 1-1.06 0L5.97 6.72a.75.75 0 1 1 1.06-1.06l1 1 4.44-4.44a.75.75 0 0 1 1.06 0Z" />
+                </svg>
+              }
+              onClick={() => setShowCommitDialog(true)}
+              title="提交改动"
+            />
+            <Show when={!props.task.directMode}>
+              <IconButton
+                icon={
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z" />
+                  </svg>
+                }
+                onClick={openMergeConfirm}
+                title="合并到主分支"
+              />
+              <div style={{ position: 'relative', display: 'inline-flex' }}>
+                <Show
+                  when={!pushing()}
+                  fallback={
+                    <div
+                      style={{
+                        display: 'inline-flex',
+                        'align-items': 'center',
+                        'justify-content': 'center',
+                        padding: '4px',
+                        border: `1px solid ${theme.border}`,
+                        'border-radius': '6px',
+                      }}
+                    >
+                      <span class="inline-spinner" style={{ width: '14px', height: '14px' }} />
+                    </div>
+                  }
+                >
+                  <IconButton
+                    icon={
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                        <path
+                          d="M4.75 8a.75.75 0 0 1 .75-.75h5.19L8.22 4.78a.75.75 0 0 1 1.06-1.06l3.5 3.5a.75.75 0 0 1 0 1.06l-3.5 3.5a.75.75 0 1 1-1.06-1.06l2.47-2.47H5.5A.75.75 0 0 1 4.75 8Z"
+                          transform="rotate(-90 8 8)"
+                        />
+                      </svg>
+                    }
+                    onClick={() => setShowPushConfirm(true)}
+                    title="推送到远程仓库"
+                  />
+                </Show>
+                <Show when={pushSuccess()}>
+                  <div
+                    style={{
+                      position: 'absolute',
+                      bottom: '-4px',
+                      right: '-4px',
+                      width: '12px',
+                      height: '12px',
+                      'border-radius': '50%',
+                      background: theme.success,
+                      display: 'flex',
+                      'align-items': 'center',
+                      'justify-content': 'center',
+                      'pointer-events': 'none',
+                    }}
+                  >
+                    <svg width="8" height="8" viewBox="0 0 16 16" fill="white">
+                      <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" />
+                    </svg>
+                  </div>
+                </Show>
+              </div>
+            </Show>
+            <IconButton
+              icon={
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z" />
+                </svg>
+              }
+              onClick={() => setShowCloseConfirm(true)}
+              title="关闭任务"
+            />
+          </div>
+        </div>
+      ),
+    };
+  }
+
+  function branchInfoBar(): PanelChild {
+    return {
+      id: 'branch',
+      initialSize: 28,
+      fixed: true,
+      content: () => (
+        <InfoBar
+          title={props.task.worktreePath}
+          onClick={() => revealItemInDir(props.task.worktreePath).catch(() => {})}
+        >
+          {(() => {
+            const project = getProject(props.task.projectId);
+            return (
+              <Show when={project}>
+                {(p) => (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditingProjectId(p().id);
+                    }}
+                    title="项目设置"
+                    style={{
+                      display: 'inline-flex',
+                      'align-items': 'center',
+                      gap: '4px',
+                      background: 'transparent',
+                      border: 'none',
+                      padding: '0',
+                      margin: '0 12px 0 0',
+                      color: 'inherit',
+                      cursor: 'pointer',
+                      'font-family': 'inherit',
+                      'font-size': 'inherit',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: '7px',
+                        height: '7px',
+                        'border-radius': '50%',
+                        background: p().color,
+                        'flex-shrink': '0',
+                      }}
+                    />
+                    {p().name}
+                  </button>
+                )}
+              </Show>
+            );
+          })()}
+          <Show when={props.task.githubUrl}>
+            {(url) => (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(url(), '_blank');
+                }}
+                title={url()}
+                style={{
+                  display: 'inline-flex',
+                  'align-items': 'center',
+                  gap: '4px',
+                  'margin-right': '12px',
+                  background: 'transparent',
+                  border: 'none',
+                  padding: '0',
+                  color: theme.accent,
+                  cursor: 'pointer',
+                  'font-family': 'inherit',
+                  'font-size': 'inherit',
+                }}
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="currentColor"
+                  style={{ 'flex-shrink': '0' }}
+                >
+                  <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+                </svg>
+                {url().replace(/^https?:\/\/(www\.)?github\.com\//, '')}
+              </button>
+            )}
+          </Show>
+          <span
+            style={{
+              display: 'inline-flex',
+              'align-items': 'center',
+              gap: '4px',
+              'margin-right': '12px',
+            }}
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 16 16"
+              fill="currentColor"
+              style={{ 'flex-shrink': '0' }}
+            >
+              <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm6.25 7.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 7.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm0 0h5.5a2.5 2.5 0 0 0 2.5-2.5v-.5a.75.75 0 0 0-1.5 0v.5a1 1 0 0 1-1 1H5a3.25 3.25 0 1 0 0 6.5h6.25a.75.75 0 0 0 0-1.5H5a1.75 1.75 0 1 1 0-3.5Z" />
+            </svg>
+            <Show when={!props.task.directMode}>{props.task.branchName}</Show>
+            <Show when={props.task.directMode}>
+              <span
+                style={{
+                  'font-size': '10px',
+                  'font-weight': '600',
+                  padding: '1px 6px',
+                  'border-radius': '4px',
+                  background: `color-mix(in srgb, ${theme.warning} 15%, transparent)`,
+                  color: theme.warning,
+                  border: `1px solid color-mix(in srgb, ${theme.warning} 25%, transparent)`,
+                }}
+              >
+                {props.task.branchName}
+              </span>
+            </Show>
+          </span>
+          <span
+            style={{ display: 'inline-flex', 'align-items': 'center', gap: '4px', opacity: 0.6 }}
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 16 16"
+              fill="currentColor"
+              style={{ 'flex-shrink': '0' }}
+            >
+              <path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z" />
+            </svg>
+            {props.task.worktreePath}
+          </span>
+        </InfoBar>
+      ),
+    };
+  }
+
+  function shellSection(): PanelChild {
+    return {
+      id: 'shell-section',
+      initialSize: 28,
+      minSize: 28,
+      get fixed() {
+        return props.task.shellAgentIds.length === 0;
+      },
+      requestSize: () => (props.task.shellAgentIds.length > 0 ? 200 : 28),
+      content: () => (
+        <ScalablePanel panelId={`${props.task.id}:shell`}>
+          <div
+            style={{
+              height: '100%',
+              display: 'flex',
+              'flex-direction': 'column',
+              background: 'transparent',
+            }}
+          >
+            <div
+              ref={shellToolbarRef}
+              class="focusable-panel shell-toolbar-panel"
+              tabIndex={0}
+              onClick={() => setTaskFocusedPanel(props.task.id, 'shell-toolbar')}
+              onFocus={() => setShellToolbarFocused(true)}
+              onBlur={() => setShellToolbarFocused(false)}
+              onKeyDown={(e) => {
+                const itemCount = 1 + projectBookmarks().length;
+                if (e.key === 'ArrowRight') {
+                  e.preventDefault();
+                  setShellToolbarIdx((i) => Math.min(itemCount - 1, i + 1));
+                } else if (e.key === 'ArrowLeft') {
+                  e.preventDefault();
+                  setShellToolbarIdx((i) => Math.max(0, i - 1));
+                } else if (e.key === 'Enter') {
+                  e.preventDefault();
+                  const idx = shellToolbarIdx();
+                  if (idx === 0) {
+                    spawnShellForTask(props.task.id);
+                  } else {
+                    const bm = projectBookmarks()[idx - 1];
+                    if (bm) spawnShellForTask(props.task.id, bm.command);
+                  }
+                }
+              }}
+              style={{
+                height: '28px',
+                'min-height': '28px',
+                display: 'flex',
+                'align-items': 'center',
+                padding: '0 8px',
+                background: 'transparent',
+                gap: '4px',
+                outline: 'none',
+              }}
+            >
+              <button
+                class="icon-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  spawnShellForTask(props.task.id);
+                }}
+                tabIndex={-1}
+                title={`打开终端 (${mod}+Shift+T)`}
+                style={{
+                  background: theme.taskPanelBg,
+                  border: `1px solid ${shellToolbarIdx() === 0 && shellToolbarFocused() ? theme.accent : theme.border}`,
+                  color: theme.fgMuted,
+                  cursor: 'pointer',
+                  'border-radius': '4px',
+                  padding: '4px 12px',
+                  'font-size': sf(13),
+                  'line-height': '1',
+                  display: 'flex',
+                  'align-items': 'center',
+                  gap: '4px',
+                }}
+              >
+                <span style={{ 'font-family': 'monospace', 'font-size': sf(13) }}>&gt;_</span>
+                <span>终端</span>
+              </button>
+              <For each={projectBookmarks()}>
+                {(bookmark, i) => (
+                  <button
+                    class="icon-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      spawnShellForTask(props.task.id, bookmark.command);
+                    }}
+                    tabIndex={-1}
+                    title={bookmark.command}
+                    style={{
+                      background: theme.taskPanelBg,
+                      border: `1px solid ${shellToolbarIdx() === i() + 1 && shellToolbarFocused() ? theme.accent : theme.border}`,
+                      color: theme.fgMuted,
+                      cursor: 'pointer',
+                      'border-radius': '4px',
+                      padding: '4px 12px',
+                      'font-size': sf(13),
+                      'line-height': '1',
+                      display: 'flex',
+                      'align-items': 'center',
+                      gap: '4px',
+                    }}
+                  >
+                    <span>{extractLabel(bookmark.command)}</span>
+                  </button>
+                )}
+              </For>
+            </div>
+            <Show when={props.task.shellAgentIds.length > 0}>
+              <div
+                style={{
+                  flex: '1',
+                  display: 'flex',
+                  overflow: 'hidden',
+                  background: theme.taskContainerBg,
+                  gap: '6px',
+                  'margin-top': '6px',
+                }}
+              >
+                <For each={props.task.shellAgentIds}>
+                  {(shellId, i) => {
+                    const initialCommand = consumePendingShellCommand(shellId);
+                    let shellFocusFn: (() => void) | undefined;
+                    let registeredKey: string | undefined;
+
+                    // Re-register focus fn whenever the index changes (e.g. after a sibling is removed)
+                    createEffect(() => {
+                      const key = `${props.task.id}:shell:${i()}`;
+                      if (registeredKey && registeredKey !== key) unregisterFocusFn(registeredKey);
+                      if (shellFocusFn) registerFocusFn(key, shellFocusFn);
+                      registeredKey = key;
+                    });
+                    onCleanup(() => {
+                      if (registeredKey) unregisterFocusFn(registeredKey);
+                    });
+
+                    const isShellFocused = () =>
+                      store.focusedPanel[props.task.id] === `shell:${i()}`;
+
+                    return (
+                      <div
+                        class="focusable-panel shell-terminal-container"
+                        data-shell-focused={isShellFocused() ? 'true' : 'false'}
+                        style={{
+                          flex: '1',
+                          overflow: 'hidden',
+                          position: 'relative',
+                          background: theme.taskPanelBg,
+                        }}
+                        onClick={() => setTaskFocusedPanel(props.task.id, `shell:${i()}`)}
+                      >
+                        <button
+                          class="shell-terminal-close"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            closeShell(props.task.id, shellId);
+                          }}
+                          title="关闭终端 (Ctrl+Shift+Q)"
+                          style={{
+                            background: 'color-mix(in srgb, var(--island-bg) 85%, transparent)',
+                            border: `1px solid ${theme.border}`,
+                            color: theme.fgMuted,
+                            cursor: 'pointer',
+                            'border-radius': '6px',
+                            padding: '2px 6px',
+                            'line-height': '1',
+                            'font-size': '14px',
+                          }}
+                        >
+                          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z" />
+                          </svg>
+                        </button>
+                        <Show when={shellExits[shellId]}>
+                          <div
+                            class="exit-badge"
+                            style={{
+                              position: 'absolute',
+                              top: '8px',
+                              right: '12px',
+                              'z-index': '10',
+                              'font-size': sf(11),
+                              color:
+                                shellExits[shellId]?.exitCode === 0 ? theme.success : theme.error,
+                              background: 'color-mix(in srgb, var(--island-bg) 80%, transparent)',
+                              padding: '4px 12px',
+                              'border-radius': '8px',
+                              border: `1px solid ${theme.border}`,
+                            }}
+                          >
+                            进程已退出（{shellExits[shellId]?.exitCode ?? '?'}）
+                          </div>
+                        </Show>
+                        <TerminalView
+                          taskId={props.task.id}
+                          agentId={shellId}
+                          kind="shell"
+                          isFocused={
+                            props.isActive && store.focusedPanel[props.task.id] === `shell:${i()}`
+                          }
+                          command={getShellCommand()}
+                          args={['-l']}
+                          cwd={props.task.worktreePath}
+                          initialCommand={initialCommand}
+                          onExit={(info) =>
+                            setShellExits(shellId, {
+                              exitCode: info.exit_code,
+                              signal: info.signal,
+                            })
+                          }
+                          onReady={(focusFn) => {
+                            shellFocusFn = focusFn;
+                            if (registeredKey) registerFocusFn(registeredKey, focusFn);
+                          }}
+                          fontSize={Math.round(11 * getFontScale(`${props.task.id}:shell`))}
+                          autoFocus
+                        />
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+          </div>
+        </ScalablePanel>
+      ),
+    };
+  }
+
+  function aiTerminal(): PanelChild {
+    return {
+      id: 'ai-terminal',
+      minSize: 80,
+      content: () => (
+        <ScalablePanel panelId={`${props.task.id}:ai-terminal`}>
+          <div
+            class="focusable-panel shell-terminal-container"
+            data-shell-focused={
+              store.focusedPanel[props.task.id] === 'ai-terminal' ? 'true' : 'false'
+            }
+            style={{
+              height: '100%',
+              position: 'relative',
+              background: theme.taskPanelBg,
+              display: 'flex',
+              'flex-direction': 'column',
+            }}
+            onClick={() => setTaskFocusedPanel(props.task.id, 'ai-terminal')}
+          >
+            <InfoBar title={props.task.lastPrompt || '使用终端内置输入框与智能体对话'}>
+              <span style={{ opacity: props.task.lastPrompt ? 1 : 0.4 }}>
+                {props.task.lastPrompt ? `> ${props.task.lastPrompt}` : '在终端内直接输入并发送'}
+              </span>
+            </InfoBar>
+            <div style={{ flex: '1', position: 'relative', overflow: 'hidden' }}>
+              <Show when={firstAgent()}>
+                {(a) => (
+                  <>
+                    <Show when={a().status === 'exited'}>
+                      <div
+                        class="exit-badge"
+                        style={{
+                          position: 'absolute',
+                          top: '8px',
+                          right: '12px',
+                          'z-index': '10',
+                          'font-size': sf(11),
+                          color: a().exitCode === 0 ? theme.success : theme.error,
+                          background: 'color-mix(in srgb, var(--island-bg) 80%, transparent)',
+                          padding: '4px 12px',
+                          'border-radius': '8px',
+                          border: `1px solid ${theme.border}`,
+                          display: 'flex',
+                          'align-items': 'center',
+                          gap: '8px',
+                        }}
+                      >
+                        <span>
+                          {a().signal === 'spawn_failed'
+                            ? '启动失败'
+                            : `进程已退出（${a().exitCode ?? '?'}）`}
+                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void restartAgent(a().id, false);
+                          }}
+                          style={{
+                            background: theme.bgElevated,
+                            border: `1px solid ${theme.border}`,
+                            color: theme.fg,
+                            padding: '2px 8px',
+                            'border-radius': '4px',
+                            cursor: 'pointer',
+                            'font-size': sf(10),
+                          }}
+                        >
+                          重启
+                        </button>
+                        <Show when={a().def.resume_args?.length}>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void restartAgent(a().id, true);
+                            }}
+                            style={{
+                              background: theme.bgElevated,
+                              border: `1px solid ${theme.border}`,
+                              color: theme.fg,
+                              padding: '2px 8px',
+                              'border-radius': '4px',
+                              cursor: 'pointer',
+                              'font-size': sf(10),
+                            }}
+                          >
+                            恢复
+                          </button>
+                        </Show>
+                      </div>
+                    </Show>
+                    <Show when={`${a().id}:${a().generation}`} keyed>
+                      <TerminalView
+                        taskId={props.task.id}
+                        agentId={a().id}
+                        kind="agent"
+                        isFocused={
+                          props.isActive && store.focusedPanel[props.task.id] === 'ai-terminal'
+                        }
+                        command={a().def.command}
+                        args={[
+                          ...(a().resumed && a().def.resume_args?.length
+                            ? (a().def.resume_args ?? [])
+                            : a().def.args),
+                          ...(props.task.skipPermissions && a().def.skip_permissions_args?.length
+                            ? (a().def.skip_permissions_args ?? [])
+                            : []),
+                        ]}
+                        cwd={props.task.worktreePath}
+                        onExit={(code) => markAgentExited(a().id, code)}
+                        onData={(data) => markAgentOutput(a().id, data, props.task.id)}
+                        onPromptDetected={(text) => setLastPrompt(props.task.id, text)}
+                        onReady={(focusFn) =>
+                          registerFocusFn(`${props.task.id}:ai-terminal`, focusFn)
+                        }
+                        fontSize={Math.round(13 * getFontScale(`${props.task.id}:ai-terminal`))}
+                      />
+                    </Show>
+                  </>
+                )}
+              </Show>
+            </div>
+          </div>
+        </ScalablePanel>
+      ),
+    };
+  }
+
+  return (
+    <div
+      ref={panelRef}
+      class={`task-column ${props.isActive ? 'active' : ''}`}
+      style={{
+        display: 'flex',
+        'flex-direction': 'column',
+        height: '100%',
+        background: theme.taskContainerBg,
+        'border-radius': '12px',
+        border: `1px solid ${theme.border}`,
+        overflow: 'clip',
+        position: 'relative',
+      }}
+      onClick={() => setActiveTask(props.task.id)}
+    >
+      <Show when={props.task.closingStatus && props.task.closingStatus !== 'removing'}>
+        <div
+          style={{
+            position: 'absolute',
+            inset: '0',
+            'z-index': '50',
+            background: 'rgba(0, 0, 0, 0.6)',
+            display: 'flex',
+            'flex-direction': 'column',
+            'align-items': 'center',
+            'justify-content': 'center',
+            gap: '12px',
+            'border-radius': '12px',
+            color: theme.fg,
+          }}
+        >
+          <Show when={props.task.closingStatus === 'closing'}>
+            <div style={{ 'font-size': '13px', color: theme.fgMuted }}>正在关闭任务...</div>
+          </Show>
+          <Show when={props.task.closingStatus === 'error'}>
+            <div style={{ 'font-size': '13px', color: theme.error, 'font-weight': '600' }}>
+              关闭失败
+            </div>
+            <div
+              style={{
+                'font-size': '11px',
+                color: theme.fgMuted,
+                'max-width': '260px',
+                'text-align': 'center',
+                'word-break': 'break-word',
+              }}
+            >
+              {props.task.closingError}
+            </div>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                retryCloseTask(props.task.id);
+              }}
+              style={{
+                background: theme.bgElevated,
+                border: `1px solid ${theme.border}`,
+                color: theme.fg,
+                padding: '6px 16px',
+                'border-radius': '6px',
+                cursor: 'pointer',
+                'font-size': '12px',
+              }}
+            >
+              重试
+            </button>
+          </Show>
+        </div>
+      </Show>
+      <ResizablePanel
+        direction="vertical"
+        persistKey={`task:${props.task.id}`}
+        children={[titleBar(), branchInfoBar(), shellSection(), aiTerminal()]}
+      />
+      <TaskDialogs
+        task={props.task}
+        showCloseConfirm={showCloseConfirm()}
+        onCloseConfirmDone={() => setShowCloseConfirm(false)}
+        showMergeConfirm={showMergeConfirm()}
+        initialCleanup={getProject(props.task.projectId)?.deleteBranchOnClose ?? true}
+        onMergeConfirmDone={() => setShowMergeConfirm(false)}
+        showPushConfirm={showPushConfirm()}
+        onPushStart={() => {
+          setPushing(true);
+          setPushSuccess(false);
+          clearTimeout(pushSuccessTimer);
+        }}
+        onPushConfirmDone={(success) => {
+          setShowPushConfirm(false);
+          setPushing(false);
+          if (success) {
+            setPushSuccess(true);
+            pushSuccessTimer = setTimeout(() => setPushSuccess(false), 3000);
+          }
+        }}
+        showBranchDialog={showBranchDialog()}
+        onBranchDialogDone={() => setShowBranchDialog(false)}
+        showCommitDialog={showCommitDialog()}
+        onCommitDialogDone={() => setShowCommitDialog(false)}
+        diffFile={diffFile()}
+        onDiffClose={() => setDiffFile(null)}
+        onDiffFileClick={setDiffFile}
+      />
+      <EditProjectDialog project={editingProject()} onClose={() => setEditingProjectId(null)} />
+    </div>
+  );
+}
+
+function getShellCommand(): string {
+  // Empty string tells the backend to use $SHELL (Unix) or %COMSPEC% (Windows)
+  return '';
+}

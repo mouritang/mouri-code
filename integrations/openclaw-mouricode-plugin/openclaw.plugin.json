@@ -1,0 +1,24 @@
+{
+  "id": "mouricode",
+  "name": "MouriCode Bridge",
+  "description": "Bridge OpenClaw tools to a local MouriCode HTTP API for task monitoring and control.",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "MouriCode bridge base URL (loopback).",
+        "default": "http://127.0.0.1:7788"
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "description": "HTTP request timeout in milliseconds.",
+        "minimum": 1000,
+        "maximum": 180000,
+        "default": 15000
+      }
+    }
+  }
+}

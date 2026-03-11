@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 56 56" fill="none">
+  <defs>
+    <!-- Glossy gradient for background -->
+    <radialGradient id="glossyBgRounded" cx="40%" cy="30%" r="80%">
+      <stop offset="0%" style="stop-color:#5a5245;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#3a3530;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2a2520;stop-opacity:1" />
+    </radialGradient>
+    <!-- Shine effect -->
+    <linearGradient id="shineRounded" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4af37;stop-opacity:0.2" />
+      <stop offset="50%" style="stop-color:#ffffff;stop-opacity:0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background with glossy gradient -->
+  <rect x="0" y="0" width="56" height="56" rx="11" fill="url(#glossyBgRounded)" stroke="none"/>
+
+  <!-- Subtle shine overlay -->
+  <ellipse cx="28" cy="16" rx="22" ry="14" fill="url(#shineRounded)"/>
+
+  <!-- Large M letter -->
+  <path d="M 12 39 L 12 15 L 28 28.5 L 44 15 L 44 39 L 37 39 L 37 24.5 L 28 35 L 19 24.5 L 19 39 Z"
+        fill="#2ec8ff"
+        stroke="#2ec8ff"
+        stroke-width="0.4"
+        stroke-linejoin="round"/>
+</svg>

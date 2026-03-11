@@ -1,0 +1,390 @@
+import { createSignal, createEffect, onMount, onCleanup, untrack, For, type JSX } from 'solid-js';
+import { getPanelSize, setPanelSizes } from '../store/store';
+
+export interface PanelChild {
+  id: string;
+  initialSize?: number;
+  fixed?: boolean;
+  /** Keep pixel size on window resize, but still allow manual drag resizing. */
+  stable?: boolean;
+  minSize?: number;
+  maxSize?: number;
+  /** Reactive getter — when the returned value changes, the panel resizes to it. */
+  requestSize?: () => number;
+  content: () => JSX.Element;
+}
+
+export interface ResizablePanelHandle {
+  /** Adjust all non-fixed panels by deltaPx (positive = wider, negative = narrower). */
+  resizeAll: (deltaPx: number) => void;
+}
+
+interface ResizablePanelProps {
+  direction: 'horizontal' | 'vertical';
+  children: PanelChild[];
+  class?: string;
+  style?: JSX.CSSProperties;
+  /** When true, panels keep their initialSizes and the container grows to fit (useful with overflow scroll). */
+  fitContent?: boolean;
+  /** When set, panel sizes are persisted to the store under keys `{persistKey}:{childId}`. */
+  persistKey?: string;
+  /** Callback to receive a handle for programmatic resize operations. */
+  onHandle?: (handle: ResizablePanelHandle) => void;
+}
+
+export function ResizablePanel(props: ResizablePanelProps) {
+  let containerRef!: HTMLDivElement;
+  const [sizes, setSizes] = createSignal<number[]>([]);
+  const [dragging, setDragging] = createSignal<number | null>(null);
+
+  const isHorizontal = () => props.direction === 'horizontal';
+
+  function initSizes() {
+    if (!containerRef) return;
+    const children = props.children;
+    const handleSpace = Math.max(0, children.length - 1) * 6;
+
+    // fitContent mode: use saved or initialSizes directly, no scaling
+    if (props.fitContent) {
+      setSizes(
+        children.map((c) => {
+          if (props.persistKey) {
+            const saved = getPanelSize(`${props.persistKey}:${c.id}`);
+            if (saved !== undefined) return saved;
+          }
+          return c.initialSize ?? 200;
+        }),
+      );
+      return;
+    }
+
+    const totalSpace = isHorizontal() ? containerRef.clientWidth : containerRef.clientHeight;
+
+    const fixedTotal = children.reduce(
+      (sum, c) => sum + (c.fixed || c.stable ? (c.initialSize ?? 0) : 0),
+      0,
+    );
+    const resizableSpace = totalSpace - fixedTotal - handleSpace;
+    const resizableCount = children.filter((c) => !c.fixed && !c.stable).length;
+    const defaultSize = resizableCount > 0 ? resizableSpace / resizableCount : 0;
+
+    // First pass: assign saved sizes, initialSizes, or 0
+    const initial = children.map((c) => {
+      if (c.fixed || c.stable) return c.initialSize ?? 0;
+      if (props.persistKey) {
+        const saved = getPanelSize(`${props.persistKey}:${c.id}`);
+        if (saved !== undefined) return saved;
+      }
+      return c.initialSize ?? 0;
+    });
+    // Compute how much space the resizable initialSizes consume
+    const usedByResizable = children.reduce(
+      (sum, c, i) => sum + (c.fixed || c.stable ? 0 : initial[i]),
+      0,
+    );
+    // Count panels without a saved or initial size
+    const unsetCount = children.filter((c) => {
+      if (c.fixed || c.stable) return false;
+      if (props.persistKey && getPanelSize(`${props.persistKey}:${c.id}`) !== undefined)
+        return false;
+      return !c.initialSize;
+    }).length;
+    // Distribute remaining space among resizable panels without a size
+    const remaining = resizableSpace - usedByResizable;
+    const extraEach = unsetCount > 0 ? remaining / unsetCount : 0;
+    // If all have sizes but don't fill, scale them proportionally
+    const scale = usedByResizable > 0 && unsetCount === 0 ? resizableSpace / usedByResizable : 1;
+
+    setSizes(
+      children.map((c, i) => {
+        if (c.fixed || c.stable) return initial[i];
+        if (initial[i] === 0) return extraEach > 0 ? extraEach : defaultSize;
+        return initial[i] * scale;
+      }),
+    );
+  }
+
+  onMount(() => {
+    initSizes();
+
+    props.onHandle?.({
+      resizeAll(deltaPx: number) {
+        setSizes((prev) =>
+          prev.map((s, i) => {
+            const child = props.children[i];
+            if (child.fixed) return s;
+            const min = child.minSize ?? 30;
+            const max = child.maxSize ?? Infinity;
+            return Math.min(max, Math.max(min, s + deltaPx));
+          }),
+        );
+        if (props.persistKey) {
+          const current = sizes();
+          const entries: Record<string, number> = {};
+          for (let i = 0; i < props.children.length; i++) {
+            const child = props.children[i];
+            if (!child.fixed) {
+              entries[`${props.persistKey}:${child.id}`] = current[i];
+            }
+          }
+          setPanelSizes(entries);
+        }
+      },
+    });
+
+    // fitContent mode doesn't need resize observer scaling
+    if (props.fitContent) return;
+
+    const ro = new ResizeObserver(() => {
+      const current = sizes();
+      if (current.length === 0) {
+        initSizes();
+        return;
+      }
+
+      const totalSpace = isHorizontal() ? containerRef.clientWidth : containerRef.clientHeight;
+      const handleSpace = Math.max(0, props.children.length - 1) * 6;
+      const pinnedTotal = props.children.reduce(
+        (sum, c, i) => sum + (c.fixed || c.stable ? current[i] : 0),
+        0,
+      );
+      const oldResizable = current.reduce(
+        (sum, s, i) => sum + (props.children[i]?.fixed || props.children[i]?.stable ? 0 : s),
+        0,
+      );
+      const newResizable = totalSpace - pinnedTotal - handleSpace;
+
+      if (oldResizable <= 0 || newResizable <= 0) return;
+
+      const ratio = newResizable / oldResizable;
+      const next = current.map((s, i) => {
+        const c = props.children[i];
+        if (c?.fixed || c?.stable) return s;
+        return s * ratio;
+      });
+      // Clamp stable panels to their minSize after resize
+      for (let i = 0; i < props.children.length; i++) {
+        const c = props.children[i];
+        if (c?.stable && c.minSize && next[i] < c.minSize) {
+          next[i] = c.minSize;
+        }
+      }
+      setSizes(next);
+    });
+    ro.observe(containerRef);
+    onCleanup(() => ro.disconnect());
+  });
+
+  // Re-init when children change (untrack initSizes to avoid store reads creating dependencies)
+  createEffect(() => {
+    void props.children.length;
+    untrack(() => initSizes());
+  });
+
+  // Watch requestSize getters and adjust sizes dynamically
+  createEffect(() => {
+    const current = untrack(() => sizes());
+    if (current.length === 0) return;
+
+    const next = [...current];
+    let changed = false;
+
+    for (let i = 0; i < props.children.length; i++) {
+      const child = props.children[i];
+      if (!child.requestSize) continue;
+      const requested = child.requestSize();
+      if (Math.abs(next[i] - requested) < 1) continue;
+
+      const diff = requested - next[i];
+      // Find nearest resizable neighbor to absorb the difference
+      let absorbed = false;
+      for (let j = i + 1; j < props.children.length; j++) {
+        if (!props.children[j].fixed) {
+          next[j] = Math.max(props.children[j].minSize ?? 30, next[j] - diff);
+          absorbed = true;
+          break;
+        }
+      }
+      if (!absorbed) {
+        for (let j = i - 1; j >= 0; j--) {
+          if (!props.children[j].fixed) {
+            next[j] = Math.max(props.children[j].minSize ?? 30, next[j] - diff);
+            break;
+          }
+        }
+      }
+      next[i] = requested;
+      changed = true;
+    }
+
+    if (changed) setSizes(next);
+  });
+
+  function findResizable(start: number, direction: -1 | 1): number {
+    for (let i = start; i >= 0 && i < props.children.length; i += direction) {
+      if (!props.children[i].fixed) return i;
+    }
+    return -1;
+  }
+
+  function handleMouseDown(handleIndex: number, e: MouseEvent) {
+    e.preventDefault();
+    setDragging(handleIndex);
+
+    const startPos = isHorizontal() ? e.clientX : e.clientY;
+    const startSizes = [...sizes()];
+
+    // Resolve which panels actually resize: skip over fixed panels
+    const leftChild = props.children[handleIndex];
+    const rightChild = props.children[handleIndex + 1];
+    const resizeLeftIdx = leftChild?.fixed ? findResizable(handleIndex, -1) : handleIndex;
+    const resizeRightIdx = rightChild?.fixed ? findResizable(handleIndex + 1, 1) : handleIndex + 1;
+
+    // Both sides are fixed (or no resizable found) — can't drag
+    // In fitContent mode, only the left panel is resized, so we only need a valid left index
+    if (resizeLeftIdx < 0) return;
+    if (resizeRightIdx < 0 && !props.fitContent) return;
+
+    const leftPanel = props.children[resizeLeftIdx];
+    const rightPanel = props.children[resizeRightIdx];
+
+    function onMove(ev: MouseEvent) {
+      const delta = (isHorizontal() ? ev.clientX : ev.clientY) - startPos;
+
+      if (props.fitContent) {
+        // In fitContent mode, only resize the left panel — container scrolls
+        const leftMin = leftPanel?.minSize ?? 30;
+        const leftMax = leftPanel?.maxSize ?? Infinity;
+        const newLeft = Math.max(leftMin, Math.min(leftMax, startSizes[resizeLeftIdx] + delta));
+        setSizes((prev) => {
+          const next = [...prev];
+          next[resizeLeftIdx] = newLeft;
+          return next;
+        });
+        return;
+      }
+
+      let newLeft = startSizes[resizeLeftIdx] + delta;
+      let newRight = startSizes[resizeRightIdx] - delta;
+
+      const leftMin = leftPanel?.minSize ?? 30;
+      const leftMax = leftPanel?.maxSize ?? Infinity;
+      const rightMin = rightPanel?.minSize ?? 30;
+      const rightMax = rightPanel?.maxSize ?? Infinity;
+
+      if (newLeft < leftMin) {
+        newRight += newLeft - leftMin;
+        newLeft = leftMin;
+      }
+      if (newRight < rightMin) {
+        newLeft += newRight - rightMin;
+        newRight = rightMin;
+      }
+      newLeft = Math.min(newLeft, leftMax);
+      newRight = Math.min(newRight, rightMax);
+
+      setSizes((prev) => {
+        const next = [...prev];
+        next[resizeLeftIdx] = newLeft;
+        next[resizeRightIdx] = newRight;
+        return next;
+      });
+    }
+
+    function onUp() {
+      setDragging(null);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+
+      if (props.persistKey) {
+        const current = sizes();
+        const entries: Record<string, number> = {};
+        for (let i = 0; i < props.children.length; i++) {
+          const child = props.children[i];
+          if (!child.fixed) {
+            entries[`${props.persistKey}:${child.id}`] = current[i];
+          }
+        }
+        setPanelSizes(entries);
+      }
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  return (
+    <div
+      ref={containerRef}
+      class={props.class}
+      style={{
+        display: 'flex',
+        'flex-direction': isHorizontal() ? 'row' : 'column',
+        width: props.fitContent ? 'fit-content' : '100%',
+        'min-width': props.fitContent ? '100%' : undefined,
+        height: '100%',
+        overflow: 'hidden',
+        ...props.style,
+      }}
+    >
+      <For each={props.children}>
+        {(child, i) => {
+          const size = () => sizes()[i()] ?? 0;
+          const showHandle = () => {
+            const idx = i();
+            if (idx >= props.children.length - 1) return false;
+
+            const leftFixed = child.fixed;
+            const rightFixed = props.children[idx + 1]?.fixed;
+
+            if (leftFixed && rightFixed) return false;
+
+            // Hide handle if no resizable panel exists on either side
+            if (leftFixed && findResizable(idx, -1) < 0) return false;
+            if (!props.fitContent && rightFixed && findResizable(idx + 1, 1) < 0) return false;
+
+            return true;
+          };
+
+          return (
+            <>
+              <div
+                style={{
+                  [isHorizontal() ? 'width' : 'height']: `${size()}px`,
+                  [isHorizontal() ? 'min-width' : 'min-height']: `${child.minSize ?? 0}px`,
+                  'flex-shrink': '0',
+                  overflow: 'hidden',
+                }}
+              >
+                {child.content()}
+              </div>
+              {(() => {
+                const idx = i();
+                if (idx >= props.children.length - 1) return null;
+
+                if (showHandle()) {
+                  return (
+                    <div
+                      class={`resize-handle resize-handle-${isHorizontal() ? 'h' : 'v'} ${dragging() === idx ? 'dragging' : ''}`}
+                      onMouseDown={(e) => handleMouseDown(idx, e)}
+                    />
+                  );
+                }
+
+                // No spacer between two adjacent fixed panels
+                if (child.fixed && props.children[idx + 1]?.fixed) return null;
+
+                // Non-interactive spacer (preserves gap without hover effect)
+                return (
+                  <div
+                    style={{ [isHorizontal() ? 'width' : 'height']: '12px', 'flex-shrink': '0' }}
+                  />
+                );
+              })()}
+            </>
+          );
+        }}
+      </For>
+    </div>
+  );
+}

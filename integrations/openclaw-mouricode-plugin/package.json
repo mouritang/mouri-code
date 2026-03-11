@@ -1,0 +1,14 @@
+{
+  "name": "mouricode",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw plugin: bridge tools to a local MouriCode HTTP API.",
+  "main": "index.js",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "license": "MIT"
+}

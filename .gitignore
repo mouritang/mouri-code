@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-electron
+dist-remote
+release
+.worktrees
+.idea
+.claude
+.DS_Store

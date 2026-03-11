@@ -1,0 +1,718 @@
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+
+const exec = promisify(execFile);
+
+// --- TTL Caches ---
+
+interface CacheEntry {
+  value: string;
+  expiresAt: number;
+}
+
+const mainBranchCache = new Map<string, CacheEntry>();
+const mergeBaseCache = new Map<string, CacheEntry>();
+const MAIN_BRANCH_TTL = 60_000; // 60s
+const MERGE_BASE_TTL = 30_000; // 30s
+const MAX_BUFFER = 10 * 1024 * 1024; // 10MB
+
+function invalidateMergeBaseCache(): void {
+  mergeBaseCache.clear();
+}
+
+function cacheKey(p: string): string {
+  return p.replace(/\/+$/, '');
+}
+
+// --- Worktree lock serialization ---
+
+const worktreeLocks = new Map<string, Promise<void>>();
+
+function withWorktreeLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = worktreeLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  worktreeLocks.set(
+    key,
+    next.then(
+      () => {},
+      () => {},
+    ),
+  );
+  return next;
+}
+
+// --- Symlink candidates ---
+
+const SYMLINK_CANDIDATES = [
+  '.claude',
+  '.cursor',
+  '.aider',
+  '.copilot',
+  '.codeium',
+  '.continue',
+  '.windsurf',
+  'node_modules',
+];
+
+// --- Internal helpers ---
+
+async function detectMainBranch(repoRoot: string): Promise<string> {
+  const key = cacheKey(repoRoot);
+  const cached = mainBranchCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const result = await detectMainBranchUncached(repoRoot);
+  mainBranchCache.set(key, { value: result, expiresAt: Date.now() + MAIN_BRANCH_TTL });
+  return result;
+}
+
+async function detectMainBranchUncached(repoRoot: string): Promise<string> {
+  // Try remote HEAD reference first
+  try {
+    const { stdout } = await exec('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
+      cwd: repoRoot,
+    });
+    const refname = stdout.trim();
+    const prefix = 'refs/remotes/origin/';
+    if (refname.startsWith(prefix)) return refname.slice(prefix.length);
+  } catch {
+    /* ignore */
+  }
+
+  // Check if 'main' exists
+  try {
+    await exec('git', ['rev-parse', '--verify', 'main'], { cwd: repoRoot });
+    return 'main';
+  } catch {
+    /* ignore */
+  }
+
+  // Fallback to 'master'
+  try {
+    await exec('git', ['rev-parse', '--verify', 'master'], { cwd: repoRoot });
+    return 'master';
+  } catch {
+    /* ignore */
+  }
+
+  // Empty repo (no commits yet) — use configured default branch or fall back to "main"
+  try {
+    const { stdout } = await exec('git', ['config', '--get', 'init.defaultBranch'], {
+      cwd: repoRoot,
+    });
+    const configured = stdout.trim();
+    if (configured) return configured;
+  } catch {
+    /* ignore */
+  }
+
+  return 'main';
+}
+
+async function getCurrentBranchName(repoRoot: string): Promise<string> {
+  const { stdout } = await exec('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: repoRoot });
+  return stdout.trim();
+}
+
+async function detectMergeBase(repoRoot: string): Promise<string> {
+  const key = cacheKey(repoRoot);
+  const cached = mergeBaseCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const mainBranch = await detectMainBranch(repoRoot);
+  let result: string;
+  try {
+    const { stdout } = await exec('git', ['merge-base', mainBranch, 'HEAD'], { cwd: repoRoot });
+    const hash = stdout.trim();
+    result = hash || mainBranch;
+  } catch {
+    result = mainBranch;
+  }
+
+  mergeBaseCache.set(key, { value: result, expiresAt: Date.now() + MERGE_BASE_TTL });
+  return result;
+}
+
+async function detectRepoLockKey(p: string): Promise<string> {
+  const { stdout } = await exec('git', ['rev-parse', '--git-common-dir'], { cwd: p });
+  const commonDir = stdout.trim();
+  const commonPath = path.isAbsolute(commonDir) ? commonDir : path.join(p, commonDir);
+  try {
+    return fs.realpathSync(commonPath);
+  } catch {
+    return commonPath;
+  }
+}
+
+function normalizeStatusPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  // Handle rename/copy "old -> new"
+  const destination = trimmed.split(' -> ').pop()?.trim() ?? trimmed;
+  return destination.replace(/^"|"$/g, '');
+}
+
+function parseConflictPath(line: string): string | null {
+  const trimmed = line.trim();
+
+  // Format: "CONFLICT (...): Merge conflict in <path>"
+  const mergeConflictIdx = trimmed.indexOf('Merge conflict in ');
+  if (mergeConflictIdx !== -1) {
+    const p = trimmed.slice(mergeConflictIdx + 'Merge conflict in '.length).trim();
+    return p || null;
+  }
+
+  if (!trimmed.startsWith('CONFLICT')) return null;
+
+  // Format: "CONFLICT (...): path <marker>"
+  const parenClose = trimmed.indexOf('): ');
+  if (parenClose === -1) return null;
+  const afterParen = trimmed.slice(parenClose + 3);
+
+  const markers = [' deleted in ', ' modified in ', ' added in ', ' renamed in ', ' changed in '];
+  let cutoff = Infinity;
+  for (const m of markers) {
+    const idx = afterParen.indexOf(m);
+    if (idx !== -1 && idx < cutoff) cutoff = idx;
+  }
+
+  const candidate = (cutoff === Infinity ? afterParen : afterParen.slice(0, cutoff)).trim();
+  return candidate || null;
+}
+
+async function computeBranchDiffStats(
+  projectRoot: string,
+  mainBranch: string,
+  branchName: string,
+): Promise<{ linesAdded: number; linesRemoved: number }> {
+  const { stdout } = await exec('git', ['diff', '--numstat', `${mainBranch}..${branchName}`], {
+    cwd: projectRoot,
+    maxBuffer: MAX_BUFFER,
+  });
+  let linesAdded = 0;
+  let linesRemoved = 0;
+  for (const line of stdout.split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length < 3) continue;
+    linesAdded += parseInt(parts[0], 10) || 0;
+    linesRemoved += parseInt(parts[1], 10) || 0;
+  }
+  return { linesAdded, linesRemoved };
+}
+
+// --- Public functions (used by tasks.ts and register.ts) ---
+
+export async function createWorktree(
+  repoRoot: string,
+  branchName: string,
+  symlinkDirs: string[],
+): Promise<{ path: string; branch: string }> {
+  const worktreePath = `${repoRoot}/.worktrees/${branchName}`;
+
+  // Try -b first (new branch), fall back to existing branch
+  try {
+    await exec('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: repoRoot });
+  } catch {
+    await exec('git', ['worktree', 'add', worktreePath, branchName], { cwd: repoRoot });
+  }
+
+  // Symlink selected directories
+  for (const name of symlinkDirs) {
+    // Reject names that could escape the worktree directory
+    if (name.includes('/') || name.includes('\\') || name.includes('..') || name === '.') continue;
+    const source = path.join(repoRoot, name);
+    const target = path.join(worktreePath, name);
+    try {
+      if (fs.statSync(source).isDirectory() && !fs.existsSync(target)) {
+        fs.symlinkSync(source, target);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return { path: worktreePath, branch: branchName };
+}
+
+export async function removeWorktree(
+  repoRoot: string,
+  branchName: string,
+  deleteBranch: boolean,
+  worktreePathOverride?: string,
+): Promise<void> {
+  const worktreePath = worktreePathOverride ?? `${repoRoot}/.worktrees/${branchName}`;
+
+  if (!fs.existsSync(repoRoot)) return;
+
+  if (fs.existsSync(worktreePath)) {
+    try {
+      await exec('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot });
+    } catch {
+      // Fallback: direct directory removal
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    }
+  }
+
+  // Prune stale worktree entries
+  try {
+    await exec('git', ['worktree', 'prune'], { cwd: repoRoot });
+  } catch {
+    /* ignore */
+  }
+
+  if (deleteBranch) {
+    try {
+      await exec('git', ['branch', '-D', '--', branchName], { cwd: repoRoot });
+    } catch (e: unknown) {
+      const msg = String(e);
+      if (!msg.toLowerCase().includes('not found')) throw e;
+    }
+  }
+}
+
+// --- IPC command functions ---
+
+export async function getGitIgnoredDirs(projectRoot: string): Promise<string[]> {
+  const results: string[] = [];
+  for (const name of SYMLINK_CANDIDATES) {
+    const dirPath = path.join(projectRoot, name);
+    try {
+      if (!fs.statSync(dirPath).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    try {
+      await exec('git', ['check-ignore', '-q', name], { cwd: projectRoot });
+      results.push(name);
+    } catch {
+      /* not ignored */
+    }
+  }
+  return results;
+}
+
+export async function getMainBranch(projectRoot: string): Promise<string> {
+  return detectMainBranch(projectRoot);
+}
+
+export async function getCurrentBranch(projectRoot: string): Promise<string> {
+  return getCurrentBranchName(projectRoot);
+}
+
+export async function getChangedFiles(worktreePath: string): Promise<
+  Array<{
+    path: string;
+    lines_added: number;
+    lines_removed: number;
+    status: string;
+    committed: boolean;
+  }>
+> {
+  const base = await detectMergeBase(worktreePath).catch(() => 'HEAD');
+
+  // git diff --raw --numstat <base>
+  let diffStr = '';
+  try {
+    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', base], {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    });
+    diffStr = stdout;
+  } catch {
+    /* empty */
+  }
+
+  const statusMap = new Map<string, string>();
+  const numstatMap = new Map<string, [number, number]>();
+
+  for (const line of diffStr.split('\n')) {
+    if (line.startsWith(':')) {
+      // --raw format
+      const parts = line.split('\t');
+      if (parts.length >= 2) {
+        const statusLetter = parts[0].split(/\s+/).pop()?.charAt(0) ?? 'M';
+        const rawPath = parts[parts.length - 1];
+        const p = normalizeStatusPath(rawPath);
+        if (p) statusMap.set(p, statusLetter);
+      }
+      continue;
+    }
+    const parts = line.split('\t');
+    if (parts.length >= 3) {
+      const added = parseInt(parts[0], 10);
+      const removed = parseInt(parts[1], 10);
+      if (!isNaN(added) && !isNaN(removed)) {
+        const rawPath = parts[parts.length - 1];
+        const p = normalizeStatusPath(rawPath);
+        if (p) numstatMap.set(p, [added, removed]);
+      }
+    }
+  }
+
+  // git status --porcelain for uncommitted paths
+  let statusStr = '';
+  try {
+    const { stdout } = await exec('git', ['status', '--porcelain'], {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    });
+    statusStr = stdout;
+  } catch {
+    /* empty */
+  }
+
+  const uncommittedPaths = new Set<string>();
+  for (const line of statusStr.split('\n')) {
+    if (line.length < 3) continue;
+    const p = normalizeStatusPath(line.slice(3));
+    if (!p) continue;
+    if (line.startsWith('??')) {
+      if (!statusMap.has(p)) statusMap.set(p, '?');
+    }
+    uncommittedPaths.add(p);
+  }
+
+  const files: Array<{
+    path: string;
+    lines_added: number;
+    lines_removed: number;
+    status: string;
+    committed: boolean;
+  }> = [];
+  const seen = new Set<string>();
+
+  for (const [p, [added, removed]] of numstatMap) {
+    const status = statusMap.get(p) ?? 'M';
+    const committed = !uncommittedPaths.has(p);
+    seen.add(p);
+    files.push({ path: p, lines_added: added, lines_removed: removed, status, committed });
+  }
+
+  // Files from statusMap not in numstat (untracked)
+  for (const [p, status] of statusMap) {
+    if (seen.has(p)) continue;
+    const fullPath = path.join(worktreePath, p);
+    let added = 0;
+    try {
+      const stat = await fs.promises.stat(fullPath);
+      if (stat.isFile() && stat.size < MAX_BUFFER) {
+        const content = await fs.promises.readFile(fullPath, 'utf8');
+        added = content.split('\n').length;
+      }
+    } catch {
+      /* ignore */
+    }
+    files.push({
+      path: p,
+      lines_added: added,
+      lines_removed: 0,
+      status,
+      committed: !uncommittedPaths.has(p),
+    });
+  }
+
+  files.sort((a, b) => {
+    if (a.committed !== b.committed) return a.committed ? -1 : 1;
+    return a.path.localeCompare(b.path);
+  });
+
+  return files;
+}
+
+export async function getFileDiff(worktreePath: string, filePath: string): Promise<string> {
+  const base = await detectMergeBase(worktreePath).catch(() => 'HEAD');
+
+  try {
+    const { stdout } = await exec('git', ['diff', base, '--', filePath], {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (stdout.trim()) return stdout;
+  } catch {
+    /* empty */
+  }
+
+  // Untracked file — format as all-additions
+  const fullPath = path.join(worktreePath, filePath);
+  try {
+    const stat = await fs.promises.stat(fullPath);
+    if (stat.isFile() && stat.size < MAX_BUFFER) {
+      const content = await fs.promises.readFile(fullPath, 'utf8');
+      const lines = content.split('\n');
+      let pseudo = `--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1,${lines.length} @@\n`;
+      for (const line of lines) {
+        pseudo += `+${line}\n`;
+      }
+      return pseudo;
+    }
+  } catch {
+    /* file doesn't exist or unreadable */
+  }
+
+  return '';
+}
+
+export async function getWorktreeStatus(
+  worktreePath: string,
+): Promise<{ has_committed_changes: boolean; has_uncommitted_changes: boolean }> {
+  const { stdout: statusOut } = await exec('git', ['status', '--porcelain'], {
+    cwd: worktreePath,
+    maxBuffer: MAX_BUFFER,
+  });
+  const hasUncommittedChanges = statusOut.trim().length > 0;
+
+  const mainBranch = await detectMainBranch(worktreePath).catch(() => 'HEAD');
+  let hasCommittedChanges = false;
+  try {
+    const { stdout: logOut } = await exec('git', ['log', `${mainBranch}..HEAD`, '--oneline'], {
+      cwd: worktreePath,
+    });
+    hasCommittedChanges = logOut.trim().length > 0;
+  } catch {
+    /* ignore */
+  }
+
+  return {
+    has_committed_changes: hasCommittedChanges,
+    has_uncommitted_changes: hasUncommittedChanges,
+  };
+}
+
+export async function checkMergeStatus(
+  worktreePath: string,
+): Promise<{ main_ahead_count: number; conflicting_files: string[] }> {
+  const mainBranch = await detectMainBranch(worktreePath);
+
+  let mainAheadCount = 0;
+  try {
+    const { stdout } = await exec('git', ['rev-list', '--count', `HEAD..${mainBranch}`], {
+      cwd: worktreePath,
+    });
+    mainAheadCount = parseInt(stdout.trim(), 10) || 0;
+  } catch {
+    /* ignore */
+  }
+
+  if (mainAheadCount === 0) return { main_ahead_count: 0, conflicting_files: [] };
+
+  const conflictingFiles: string[] = [];
+  try {
+    await exec('git', ['merge-tree', '--write-tree', 'HEAD', mainBranch], { cwd: worktreePath });
+  } catch (e: unknown) {
+    // merge-tree outputs conflict info on failure
+    const output = String(e);
+    for (const line of output.split('\n')) {
+      const p = parseConflictPath(line);
+      if (p) conflictingFiles.push(p);
+    }
+  }
+
+  return { main_ahead_count: mainAheadCount, conflicting_files: conflictingFiles };
+}
+
+export async function mergeTask(
+  projectRoot: string,
+  branchName: string,
+  squash: boolean,
+  message: string | null,
+  cleanup: boolean,
+  worktreePath?: string,
+): Promise<{ main_branch: string; lines_added: number; lines_removed: number }> {
+  const lockKey = await detectRepoLockKey(projectRoot).catch(() => projectRoot);
+
+  return withWorktreeLock(lockKey, async () => {
+    const mainBranch = await detectMainBranch(projectRoot);
+    const { linesAdded, linesRemoved } = await computeBranchDiffStats(
+      projectRoot,
+      mainBranch,
+      branchName,
+    );
+
+    // Verify clean working tree
+    const { stdout: statusOut } = await exec('git', ['status', '--porcelain'], {
+      cwd: projectRoot,
+    });
+    if (statusOut.trim()) throw new Error('项目根目录存在未提交改动。请先提交或暂存后再执行合并。');
+
+    const originalBranch = await getCurrentBranchName(projectRoot).catch(() => null);
+
+    // Checkout main
+    await exec('git', ['checkout', mainBranch], { cwd: projectRoot });
+
+    const restoreBranch = async () => {
+      if (originalBranch) {
+        try {
+          await exec('git', ['checkout', originalBranch], { cwd: projectRoot });
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    if (squash) {
+      try {
+        await exec('git', ['merge', '--squash', '--', branchName], { cwd: projectRoot });
+      } catch (e) {
+        await exec('git', ['reset', '--hard', 'HEAD'], { cwd: projectRoot }).catch(() => {});
+        await restoreBranch();
+        throw new Error(`压缩合并失败：${e}`);
+      }
+      const msg = message ?? '压缩合并';
+      try {
+        await exec('git', ['commit', '-m', msg], { cwd: projectRoot });
+      } catch (e) {
+        await exec('git', ['reset', '--hard', 'HEAD'], { cwd: projectRoot }).catch(() => {});
+        await restoreBranch();
+        throw new Error(`提交失败：${e}`);
+      }
+    } else {
+      try {
+        await exec('git', ['merge', '--', branchName], { cwd: projectRoot });
+      } catch (e) {
+        await exec('git', ['merge', '--abort'], { cwd: projectRoot }).catch(() => {});
+        await restoreBranch();
+        throw new Error(`合并失败：${e}`);
+      }
+    }
+
+    invalidateMergeBaseCache();
+
+    if (cleanup) {
+      await removeWorktree(projectRoot, branchName, true, worktreePath);
+    }
+
+    await restoreBranch();
+
+    return { main_branch: mainBranch, lines_added: linesAdded, lines_removed: linesRemoved };
+  });
+}
+
+export async function getBranchLog(worktreePath: string): Promise<string> {
+  const mainBranch = await detectMainBranch(worktreePath).catch(() => 'HEAD');
+  try {
+    const { stdout } = await exec('git', ['log', `${mainBranch}..HEAD`, '--pretty=format:- %s'], {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    });
+    return stdout;
+  } catch {
+    return '';
+  }
+}
+
+export async function pushTask(projectRoot: string, branchName: string): Promise<void> {
+  await exec('git', ['push', '-u', 'origin', '--', branchName], { cwd: projectRoot });
+}
+
+export async function listBranches(
+  worktreePath: string,
+): Promise<Array<{ name: string; current: boolean }>> {
+  const { stdout } = await exec(
+    'git',
+    ['for-each-ref', '--format=%(refname:short)%09%(HEAD)', 'refs/heads'],
+    {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    },
+  );
+
+  const branches = stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const [name, head] = line.split('\t');
+      return {
+        name: name.trim(),
+        current: head?.trim() === '*',
+      };
+    })
+    .filter((b) => b.name.length > 0);
+
+  branches.sort((a, b) => {
+    if (a.current !== b.current) return a.current ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return branches;
+}
+
+export async function checkoutBranch(
+  worktreePath: string,
+  branchName: string,
+): Promise<{ current_branch: string }> {
+  const lockKey = await detectRepoLockKey(worktreePath).catch(() => worktreePath);
+
+  return withWorktreeLock(lockKey, async () => {
+    await exec('git', ['checkout', branchName], { cwd: worktreePath });
+    invalidateMergeBaseCache();
+    const currentBranch = await getCurrentBranchName(worktreePath);
+    return { current_branch: currentBranch };
+  });
+}
+
+export async function createBranch(
+  worktreePath: string,
+  branchName: string,
+): Promise<{ current_branch: string }> {
+  const lockKey = await detectRepoLockKey(worktreePath).catch(() => worktreePath);
+
+  return withWorktreeLock(lockKey, async () => {
+    await exec('git', ['checkout', '-b', branchName], { cwd: worktreePath });
+    invalidateMergeBaseCache();
+    const currentBranch = await getCurrentBranchName(worktreePath);
+    return { current_branch: currentBranch };
+  });
+}
+
+export async function commitChanges(
+  worktreePath: string,
+  message: string,
+): Promise<{ commit_hash: string; branch_name: string }> {
+  const trimmed = message.trim();
+  if (!trimmed) throw new Error('提交信息不能为空。');
+
+  const lockKey = await detectRepoLockKey(worktreePath).catch(() => worktreePath);
+  return withWorktreeLock(lockKey, async () => {
+    const { stdout: statusOut } = await exec('git', ['status', '--porcelain'], {
+      cwd: worktreePath,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (!statusOut.trim()) throw new Error('没有可提交的改动。');
+
+    await exec('git', ['add', '-A'], { cwd: worktreePath, maxBuffer: MAX_BUFFER });
+
+    try {
+      await exec('git', ['commit', '-m', trimmed], { cwd: worktreePath, maxBuffer: MAX_BUFFER });
+    } catch (e: unknown) {
+      throw new Error(`提交失败：${e}`);
+    }
+
+    invalidateMergeBaseCache();
+    const [{ stdout: hashOut }, branchName] = await Promise.all([
+      exec('git', ['rev-parse', '--short', 'HEAD'], { cwd: worktreePath }),
+      getCurrentBranchName(worktreePath).catch(() => 'HEAD'),
+    ]);
+
+    return {
+      commit_hash: hashOut.trim(),
+      branch_name: branchName,
+    };
+  });
+}
+
+export async function rebaseTask(worktreePath: string): Promise<void> {
+  const lockKey = await detectRepoLockKey(worktreePath).catch(() => worktreePath);
+
+  return withWorktreeLock(lockKey, async () => {
+    const mainBranch = await detectMainBranch(worktreePath);
+    try {
+      await exec('git', ['rebase', mainBranch], { cwd: worktreePath });
+    } catch (e) {
+      await exec('git', ['rebase', '--abort'], { cwd: worktreePath }).catch(() => {});
+      throw new Error(`变基失败：${e}`);
+    }
+    invalidateMergeBaseCache();
+  });
+}
