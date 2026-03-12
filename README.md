@@ -145,12 +145,20 @@ npm run build
 
 ---
 
-## Repository Remotes
+## Repository
 
-This workspace currently has these Git remotes configured:
+- GitHub: [https://github.com/mouritang/mouri-code](https://github.com/mouritang/mouri-code)
+- Gitee: [https://gitee.com/mouritang/mouri-code](https://gitee.com/mouritang/mouri-code)
 
-- `mine`: `git@github.com:mouritang/mouri-code.git`
-- `origin`: `https://github.com/johannesjo/parallel-code.git`
+### Clone
+
+```bash
+# GitHub
+git clone https://github.com/mouritang/mouri-code.git
+
+# Gitee (国内镜像)
+git clone https://gitee.com/mouritang/mouri-code.git
+```
 
 ---
 

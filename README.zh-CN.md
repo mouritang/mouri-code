@@ -145,12 +145,20 @@ npm run build
 
 ---
 
-## 仓库远程地址
+## 仓库地址
 
-当前工作区配置的 Git 远程仓库：
+- GitHub: [https://github.com/mouritang/mouri-code](https://github.com/mouritang/mouri-code)
+- Gitee: [https://gitee.com/mouritang/mouri-code](https://gitee.com/mouritang/mouri-code)
 
-- `mine`: `git@github.com:mouritang/mouri-code.git`
-- `origin`: `https://github.com/johannesjo/parallel-code.git`
+### 克隆仓库
+
+```bash
+# GitHub
+git clone https://github.com/mouritang/mouri-code.git
+
+# Gitee (国内镜像，速度更快)
+git clone https://gitee.com/mouritang/mouri-code.git
+```
 
 ---
 
