@@ -124,8 +124,12 @@ export function unsubscribeAgent(agentId: string): void {
 }
 
 export function onOutput(agentId: string, fn: OutputListener): () => void {
-  if (!outputListeners.has(agentId)) outputListeners.set(agentId, new Set());
-  outputListeners.get(agentId)!.add(fn);
+  let set = outputListeners.get(agentId);
+  if (!set) {
+    set = new Set();
+    outputListeners.set(agentId, set);
+  }
+  set.add(fn);
   return () => {
     const set = outputListeners.get(agentId);
     set?.delete(fn);
@@ -134,8 +138,12 @@ export function onOutput(agentId: string, fn: OutputListener): () => void {
 }
 
 export function onScrollback(agentId: string, fn: ScrollbackListener): () => void {
-  if (!scrollbackListeners.has(agentId)) scrollbackListeners.set(agentId, new Set());
-  scrollbackListeners.get(agentId)!.add(fn);
+  let set = scrollbackListeners.get(agentId);
+  if (!set) {
+    set = new Set();
+    scrollbackListeners.set(agentId, set);
+  }
+  set.add(fn);
   return () => {
     const set = scrollbackListeners.get(agentId);
     set?.delete(fn);

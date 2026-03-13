@@ -1,5 +1,5 @@
 import { onMount, onCleanup, createEffect } from 'solid-js';
-import { Terminal } from '@xterm/xterm';
+import { Terminal, type IDisposable, type ILink } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -9,7 +9,7 @@ import { getTerminalFontFamily } from '../lib/fonts';
 import { getTerminalTheme } from '../lib/theme';
 import { matchesGlobalShortcut } from '../lib/shortcuts';
 import { isMac } from '../lib/platform';
-import { store } from '../store/store';
+import { store, openImagePreview } from '../store/store';
 import { registerTerminal, unregisterTerminal, markDirty } from '../lib/terminalFitManager';
 import type { PtyOutput } from '../ipc/types';
 
@@ -68,6 +68,7 @@ export function TerminalView(props: TerminalViewProps) {
   let term: Terminal | undefined;
   let fitAddon: FitAddon | undefined;
   let webglAddon: WebglAddon | undefined;
+  let imageLinkProviderDisposable: IDisposable | undefined;
 
   onMount(() => {
     // Capture props eagerly so cleanup/callbacks always use the original values
@@ -88,8 +89,82 @@ export function TerminalView(props: TerminalViewProps) {
     term.loadAddon(fitAddon);
     term.loadAddon(new WebLinksAddon());
 
+    // Clickable local image paths → open built-in preview dialog.
+    // This lets agents "send an image" by printing a file path (or file:// URL).
+    imageLinkProviderDisposable = term.registerLinkProvider({
+      provideLinks: (bufferLineNumber, callback) => {
+        try {
+          const line = term?.buffer.active.getLine(bufferLineNumber);
+          if (!line) return callback(undefined);
+          const text = line.translateToString(true);
+          if (!text) return callback(undefined);
+          if (!/\.(png|jpe?g|gif|webp)\b/i.test(text)) return callback(undefined);
+
+          type Match = { start: number; end: number; linkText: string };
+          const matches: Match[] = [];
+
+          const patterns: Array<{ re: RegExp; group: 1 | 0 }> = [
+            { re: /"(file:\/\/\/[^"\r\n]+?\.(?:png|jpe?g|gif|webp))"/gi, group: 1 },
+            { re: /'(file:\/\/\/[^'\r\n]+?\.(?:png|jpe?g|gif|webp))'/gi, group: 1 },
+            { re: /"(\/[^"\r\n]+?\.(?:png|jpe?g|gif|webp))"/gi, group: 1 },
+            { re: /'(\/[^'\r\n]+?\.(?:png|jpe?g|gif|webp))'/gi, group: 1 },
+            { re: /(file:\/\/\/[^\s"'<>]+?\.(?:png|jpe?g|gif|webp))/gi, group: 1 },
+            { re: /(\/[^\s"'<>]+?\.(?:png|jpe?g|gif|webp))/gi, group: 1 },
+          ];
+
+          for (const { re, group } of patterns) {
+            re.lastIndex = 0;
+            for (let m = re.exec(text); m; m = re.exec(text)) {
+              const linkText = group === 1 ? (m[1] ?? '') : (m[0] ?? '');
+              if (!linkText) continue;
+              const within = m.index + m[0].indexOf(linkText);
+              matches.push({ start: within, end: within + linkText.length, linkText });
+            }
+          }
+
+          if (matches.length === 0) return callback(undefined);
+          matches.sort((a, b) => a.start - b.start || a.end - b.end);
+
+          // De-dupe overlaps (e.g. file:///... also contains /...).
+          const filtered: Match[] = [];
+          let lastEnd = -1;
+          for (const m of matches) {
+            if (m.start < lastEnd) continue;
+            filtered.push(m);
+            lastEnd = m.end;
+          }
+
+          const y = bufferLineNumber + 1; // IBufferRange uses 1-based coords
+          const links: ILink[] = filtered.map((m) => ({
+            range: {
+              start: { x: m.start + 1, y },
+              end: { x: m.end + 1, y },
+            },
+            text: m.linkText,
+            activate: (_event, linkText) => {
+              let path = linkText;
+              if (linkText.startsWith('file://')) {
+                const raw = linkText.slice('file://'.length);
+                try {
+                  path = decodeURIComponent(raw);
+                } catch {
+                  path = raw;
+                }
+              }
+              const filename = path.split('/').pop() || '图片预览';
+              openImagePreview(path, filename);
+            },
+          }));
+
+          return callback(links);
+        } catch {
+          return callback(undefined);
+        }
+      },
+    });
+
     term.open(containerRef);
-    props.onReady?.(() => term!.focus());
+    props.onReady?.(() => term?.focus());
 
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       if (e.type !== 'keydown') return true;
@@ -105,7 +180,7 @@ export function TerminalView(props: TerminalViewProps) {
         : e.ctrlKey && e.shiftKey && e.key === 'V';
 
       if (isCopy) {
-        const sel = term!.getSelection();
+        const sel = term?.getSelection();
         if (sel) navigator.clipboard.writeText(sel);
         return false;
       }
@@ -238,7 +313,8 @@ export function TerminalView(props: TerminalViewProps) {
         enqueueOutput(base64ToUint8Array(msg.data));
         if (!initialCommandSent && props.initialCommand) {
           initialCommandSent = true;
-          setTimeout(() => enqueueInput(props.initialCommand! + '\r'), 50);
+          const cmd = props.initialCommand;
+          setTimeout(() => enqueueInput(cmd + '\r'), 50);
         }
       } else if (msg.type === 'Exit') {
         pendingExitPayload = msg.data;
@@ -284,7 +360,7 @@ export function TerminalView(props: TerminalViewProps) {
         for (const ch of data) {
           if (ch === '\r') {
             const trimmed = inputBuffer.trim();
-            if (trimmed) props.onPromptDetected!(trimmed);
+            if (trimmed) props.onPromptDetected(trimmed);
             inputBuffer = '';
           } else if (ch === '\x7f') {
             inputBuffer = inputBuffer.slice(0, -1);
@@ -360,7 +436,7 @@ export function TerminalView(props: TerminalViewProps) {
       // Strip control/escape characters to prevent terminal escape injection
       // eslint-disable-next-line no-control-regex -- intentionally stripping control/escape chars to prevent terminal injection
       const safeErr = String(err).replace(/[\x00-\x1f\x7f]/g, '');
-      term!.write(`\x1b[31mFailed to spawn: ${safeErr}\x1b[0m\r\n`);
+      term?.write(`\x1b[31mFailed to spawn: ${safeErr}\x1b[0m\r\n`);
       props.onExit?.({
         exit_code: null,
         signal: 'spawn_failed',
@@ -375,12 +451,15 @@ export function TerminalView(props: TerminalViewProps) {
       if (resizeFlushTimer !== undefined) clearTimeout(resizeFlushTimer);
       if (outputRaf !== undefined) cancelAnimationFrame(outputRaf);
       onOutput.cleanup?.();
+      imageLinkProviderDisposable?.dispose();
+      imageLinkProviderDisposable = undefined;
       webglAddon?.dispose();
       webglAddon = undefined;
       unregisterTerminal(agentId);
       // kill_agent already clears paused flag before killing
       invoke(IPC.KillAgent, { agentId });
-      term!.dispose();
+      term?.dispose();
+      term = undefined;
     });
   });
 

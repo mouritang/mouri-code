@@ -1,12 +1,21 @@
 import { For, Show, createEffect, createMemo, createSignal } from 'solid-js';
 import {
   store,
+  describeImages,
+  openImagePreview,
   runGlobalMonitorNow,
   sendGlobalMonitorPrompt,
+  showNotification,
   toggleSettingsDialog,
 } from '../store/store';
+import { openDialog } from '../lib/dialog';
 import { theme } from '../lib/theme';
 import { sf } from '../lib/fontScale';
+import { invoke } from '../lib/ipc';
+import { IPC } from '../../electron/ipc/channels';
+import type { SaveClipboardImageResult } from '../ipc/types';
+
+const MAX_IMAGE_ATTACHMENTS = 4;
 
 function globalAssistantStatusLabel() {
   if (!store.globalMonitor.enabled) return '已关闭';
@@ -57,11 +66,27 @@ function taskStatusLabel(status: string): string {
   }
 }
 
+function isSupportedImagePath(p: string): boolean {
+  const lower = p.toLowerCase();
+  return (
+    lower.endsWith('.png') ||
+    lower.endsWith('.jpg') ||
+    lower.endsWith('.jpeg') ||
+    lower.endsWith('.webp') ||
+    lower.endsWith('.gif')
+  );
+}
+
+function basename(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+}
+
 export function GlobalAssistantCard() {
   const [collapsed, setCollapsed] = createSignal(false);
   const [selectedTaskId, setSelectedTaskId] = createSignal('');
   const [draftPrompt, setDraftPrompt] = createSignal('');
   const [sending, setSending] = createSignal(false);
+  const [imagePaths, setImagePaths] = createSignal<string[]>([]);
 
   const runningTasks = createMemo(() =>
     store.taskOrder
@@ -91,13 +116,114 @@ export function GlobalAssistantCard() {
   async function handleSend(): Promise<void> {
     const taskId = selectedTaskId();
     const prompt = draftPrompt().trim();
-    if (!taskId || !prompt || sending()) return;
+    const images = imagePaths();
+    if (!taskId || (!prompt && images.length === 0) || sending()) return;
     setSending(true);
     try {
-      await sendGlobalMonitorPrompt(taskId, prompt);
+      const imageList = images.map((p) => `- ${p}`).join('\n');
+      let finalPrompt = prompt || '请根据我附上的图片给出建议，并指出关键信息。';
+
+      if (images.length > 0) {
+        if (store.vision.enabled) {
+          try {
+            const description = await describeImages(finalPrompt, images);
+            finalPrompt = [
+              finalPrompt,
+              '',
+              '【图片解析】',
+              description,
+              '',
+              '【图片路径】',
+              imageList,
+            ].join('\n');
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            showNotification(`图片解析失败：${msg}`);
+            finalPrompt = [finalPrompt, '', '【图片路径】', imageList].join('\n');
+          }
+        } else {
+          finalPrompt = [finalPrompt, '', '【图片路径】', imageList].join('\n');
+        }
+      }
+
+      await sendGlobalMonitorPrompt(taskId, finalPrompt);
       setDraftPrompt('');
+      setImagePaths([]);
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handlePickImages(): Promise<void> {
+    const selected = await openDialog({ multiple: true });
+    if (!selected) return;
+    const paths = (Array.isArray(selected) ? selected : [selected]).filter((p) => p && p.trim());
+
+    const supported = paths.filter((p) => isSupportedImagePath(p));
+    const unsupportedCount = paths.length - supported.length;
+
+    if (supported.length === 0) {
+      showNotification('请选择 PNG/JPG/WebP/GIF 图片文件');
+      return;
+    }
+    if (unsupportedCount > 0) {
+      showNotification(`已忽略 ${unsupportedCount} 个不支持的文件（仅支持 PNG/JPG/WebP/GIF）`);
+    }
+
+    const prev = imagePaths();
+    if (prev.length >= MAX_IMAGE_ATTACHMENTS) {
+      showNotification(`最多可附加 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
+      return;
+    }
+
+    const next: string[] = [...prev];
+    let ignored = 0;
+    for (const p of supported) {
+      if (next.includes(p)) continue;
+      if (next.length >= MAX_IMAGE_ATTACHMENTS) {
+        ignored++;
+        continue;
+      }
+      next.push(p);
+    }
+    if (ignored > 0) {
+      showNotification(`最多可附加 ${MAX_IMAGE_ATTACHMENTS} 张图片，已忽略 ${ignored} 张`);
+    }
+    setImagePaths(next);
+  }
+
+  function clipboardHasImage(e: ClipboardEvent): boolean {
+    const dt = e.clipboardData;
+    if (!dt) return false;
+    const items = Array.from(dt.items ?? []);
+    return items.some((item) => item.kind === 'file' && item.type.startsWith('image/'));
+  }
+
+  async function handlePasteIntoPrompt(event: ClipboardEvent): Promise<void> {
+    if (!clipboardHasImage(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (sending()) return;
+
+    const prev = imagePaths();
+    if (prev.length >= MAX_IMAGE_ATTACHMENTS) {
+      showNotification(`最多可附加 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
+      return;
+    }
+
+    try {
+      const result = await invoke<SaveClipboardImageResult>(IPC.SaveClipboardImage);
+      if (!result.ok) {
+        showNotification(result.reason || '剪贴板没有图片');
+        return;
+      }
+      const next = prev.includes(result.filePath) ? prev : [...prev, result.filePath];
+      setImagePaths(next);
+      showNotification('已从剪贴板添加 1 张图片');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showNotification(`粘贴图片失败：${msg}`);
     }
   }
 
@@ -314,7 +440,8 @@ export function GlobalAssistantCard() {
             <textarea
               value={draftPrompt()}
               onInput={(event) => setDraftPrompt(event.currentTarget.value)}
-              placeholder="输入要发送给所选任务终端 CLI 的指令"
+              onPaste={(event) => void handlePasteIntoPrompt(event)}
+              placeholder="输入要发送给所选任务终端 CLI 的指令（支持粘贴截图）"
               rows={3}
               style={{
                 width: '100%',
@@ -328,6 +455,71 @@ export function GlobalAssistantCard() {
                 'box-sizing': 'border-box',
               }}
             />
+            <Show when={imagePaths().length > 0}>
+              <div
+                style={{
+                  display: 'flex',
+                  'flex-direction': 'column',
+                  gap: '6px',
+                  padding: '8px',
+                  background: theme.bgElevated,
+                  border: `1px solid ${theme.border}`,
+                  'border-radius': '8px',
+                }}
+              >
+                <span style={{ 'font-size': sf(10), color: theme.fgMuted }}>已附加图片</span>
+                <For each={imagePaths()}>
+                  {(p) => (
+                    <div
+                      style={{
+                        display: 'flex',
+                        'align-items': 'center',
+                        'justify-content': 'space-between',
+                        gap: '8px',
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => openImagePreview(p, basename(p))}
+                        style={{
+                          background: 'transparent',
+                          border: 'none',
+                          padding: '0',
+                          color: theme.fg,
+                          cursor: 'pointer',
+                          'font-size': sf(10),
+                          'text-align': 'left',
+                          overflow: 'hidden',
+                          'text-overflow': 'ellipsis',
+                          'white-space': 'nowrap',
+                          flex: 1,
+                        }}
+                        title="点击预览"
+                      >
+                        {basename(p)}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setImagePaths((prev) => prev.filter((x) => x !== p))}
+                        style={{
+                          background: 'transparent',
+                          border: `1px solid ${theme.border}`,
+                          color: theme.fgMuted,
+                          padding: '2px 6px',
+                          'border-radius': '6px',
+                          cursor: 'pointer',
+                          'font-size': sf(10),
+                          'flex-shrink': '0',
+                        }}
+                        title="移除"
+                      >
+                        移除
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
             <div
               style={{
                 display: 'flex',
@@ -339,35 +531,66 @@ export function GlobalAssistantCard() {
               <span style={{ 'font-size': sf(10), color: theme.fgMuted }}>
                 上次汇报：{formatMonitorTime(store.globalMonitor.lastRunAt)}
               </span>
-              <button
-                type="button"
-                onClick={() => void handleSend()}
-                disabled={!selectedTaskId() || !draftPrompt().trim() || sending()}
-                style={{
-                  padding: '6px 10px',
-                  background:
-                    !selectedTaskId() || !draftPrompt().trim() || sending()
-                      ? theme.bgElevated
-                      : theme.accent,
-                  border: `1px solid ${
-                    !selectedTaskId() || !draftPrompt().trim() || sending()
-                      ? theme.border
-                      : theme.accent
-                  }`,
-                  'border-radius': '8px',
-                  color:
-                    !selectedTaskId() || !draftPrompt().trim() || sending()
-                      ? theme.fgMuted
-                      : '#fff',
-                  cursor:
-                    !selectedTaskId() || !draftPrompt().trim() || sending()
-                      ? 'not-allowed'
-                      : 'pointer',
-                  'font-size': sf(11),
-                }}
-              >
-                {sending() ? '发送中…' : '发送指令'}
-              </button>
+              <div style={{ display: 'flex', 'align-items': 'center', gap: '8px' }}>
+                <button
+                  type="button"
+                  onClick={() => void handlePickImages()}
+                  disabled={sending()}
+                  style={{
+                    padding: '6px 10px',
+                    background: theme.bgElevated,
+                    border: `1px solid ${theme.border}`,
+                    'border-radius': '8px',
+                    color: theme.fg,
+                    cursor: sending() ? 'not-allowed' : 'pointer',
+                    'font-size': sf(11),
+                  }}
+                  title="选择图片文件（PNG/JPG/WebP/GIF）"
+                >
+                  添加图片
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSend()}
+                  disabled={
+                    !selectedTaskId() ||
+                    (!draftPrompt().trim() && imagePaths().length === 0) ||
+                    sending()
+                  }
+                  style={{
+                    padding: '6px 10px',
+                    background:
+                      !selectedTaskId() ||
+                      (!draftPrompt().trim() && imagePaths().length === 0) ||
+                      sending()
+                        ? theme.bgElevated
+                        : theme.accent,
+                    border: `1px solid ${
+                      !selectedTaskId() ||
+                      (!draftPrompt().trim() && imagePaths().length === 0) ||
+                      sending()
+                        ? theme.border
+                        : theme.accent
+                    }`,
+                    'border-radius': '8px',
+                    color:
+                      !selectedTaskId() ||
+                      (!draftPrompt().trim() && imagePaths().length === 0) ||
+                      sending()
+                        ? theme.fgMuted
+                        : '#fff',
+                    cursor:
+                      !selectedTaskId() ||
+                      (!draftPrompt().trim() && imagePaths().length === 0) ||
+                      sending()
+                        ? 'not-allowed'
+                        : 'pointer',
+                    'font-size': sf(11),
+                  }}
+                >
+                  {sending() ? '发送中…' : '发送指令'}
+                </button>
+              </div>
             </div>
           </div>
 

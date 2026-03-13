@@ -439,6 +439,17 @@ export async function getFileDiff(worktreePath: string, filePath: string): Promi
   try {
     const stat = await fs.promises.stat(fullPath);
     if (stat.isFile() && stat.size < MAX_BUFFER) {
+      const ext = path.extname(filePath).toLowerCase();
+      if (
+        ext === '.png' ||
+        ext === '.jpg' ||
+        ext === '.jpeg' ||
+        ext === '.gif' ||
+        ext === '.webp'
+      ) {
+        // Make sure binary assets (like images) don't get rendered as UTF-8 junk.
+        return `Binary files /dev/null and b/${filePath} differ\n`;
+      }
       const content = await fs.promises.readFile(fullPath, 'utf8');
       const lines = content.split('\n');
       let pseudo = `--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1,${lines.length} @@\n`;

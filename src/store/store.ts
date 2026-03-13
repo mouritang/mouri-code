@@ -111,7 +111,15 @@ export {
   updateTerminalName,
   syncTerminalCounter,
 } from './terminals';
+export { openImagePreview, closeImagePreview } from './imagePreview';
 export { startRemoteAccess, stopRemoteAccess, refreshRemoteStatus } from './remote';
+export {
+  setVisionEnabled,
+  setVisionApiKey,
+  setVisionEndpoint,
+  setVisionModel,
+  describeImages,
+} from './vision';
 export {
   syncGlobalMonitorConfig,
   refreshGlobalMonitorStatus,

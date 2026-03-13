@@ -221,11 +221,13 @@ export function ConnectPhoneModal(props: ConnectPhoneModalProps) {
 
               {/* QR Code */}
               <Show when={qrDataUrl()}>
-                <img
-                  src={qrDataUrl()!}
-                  alt="连接二维码"
-                  style={{ width: '200px', height: '200px', 'border-radius': '8px' }}
-                />
+                {(url) => (
+                  <img
+                    src={url()}
+                    alt="连接二维码"
+                    style={{ width: '200px', height: '200px', 'border-radius': '8px' }}
+                  />
+                )}
               </Show>
 
               {/* URL */}

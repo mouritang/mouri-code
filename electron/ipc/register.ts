@@ -1,4 +1,4 @@
-import { ipcMain, dialog, shell, BrowserWindow } from 'electron';
+import { ipcMain, dialog, shell, BrowserWindow, clipboard } from 'electron';
 import { fileURLToPath } from 'url';
 import { IPC } from './channels.js';
 import {
@@ -35,7 +35,11 @@ import {
 import { createTask, deleteTask } from './tasks.js';
 import { listAgents } from './agents.js';
 import { saveAppState, loadAppState } from './persistence.js';
+import { describeImages } from './vision.js';
 import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import crypto from 'crypto';
 
 /** Reject paths that are non-absolute or attempt directory traversal. */
 function validatePath(p: unknown, label: string): void {
@@ -87,6 +91,72 @@ export function registerAllHandlers(win: BrowserWindow): void {
   ipcMain.handle(IPC.UpdateGlobalMonitorConfig, (_e, args) => globalMonitor.updateConfig(args));
   ipcMain.handle(IPC.GetGlobalMonitorStatus, () => globalMonitor.getState());
   ipcMain.handle(IPC.RunGlobalMonitorNow, () => globalMonitor.runNow());
+  ipcMain.handle(IPC.VisionDescribeImages, async (_e, args) => {
+    const prompt = typeof args?.prompt === 'string' ? args.prompt : '';
+    const imagePathsRaw = Array.isArray(args?.imagePaths) ? (args.imagePaths as unknown[]) : [];
+    const imagePaths = imagePathsRaw.filter((p): p is string => typeof p === 'string');
+    for (const p of imagePaths) validatePath(p, 'imagePath');
+
+    const apiKey = typeof args?.apiKey === 'string' ? args.apiKey : undefined;
+    const endpoint = typeof args?.endpoint === 'string' ? args.endpoint : undefined;
+    const model = typeof args?.model === 'string' ? args.model : undefined;
+
+    const description = await describeImages({ prompt, imagePaths, apiKey, endpoint, model });
+    return { description };
+  });
+  ipcMain.handle(IPC.SaveClipboardImage, async () => {
+    const img = clipboard.readImage();
+    if (img.isEmpty()) {
+      return { ok: false, reason: '剪贴板没有图片' };
+    }
+
+    // Keep this aligned with electron/ipc/vision.ts MAX_IMAGE_BYTES (8MB).
+    const MAX_BYTES = 8 * 1024 * 1024;
+
+    let data = img.toPNG();
+    let mime = 'image/png';
+    let ext = 'png';
+
+    // If screenshot is too big, try JPEG first (usually shrinks dramatically).
+    if (data.length > MAX_BYTES) {
+      const qualities = [90, 85, 80, 75, 70, 65, 60];
+      for (const q of qualities) {
+        const jpeg = img.toJPEG(q);
+        if (jpeg.length <= MAX_BYTES) {
+          data = jpeg;
+          mime = 'image/jpeg';
+          ext = 'jpg';
+          break;
+        }
+      }
+    }
+
+    // Still too big: downscale then JPEG.
+    if (data.length > MAX_BYTES) {
+      const size = img.getSize();
+      let width = size.width;
+      // Shrink until it fits or becomes unreasonable.
+      for (let i = 0; i < 6 && data.length > MAX_BYTES; i++) {
+        width = Math.max(320, Math.round(width * 0.75));
+        const resized = img.resize({ width, quality: 'good' });
+        const jpeg = resized.toJPEG(80);
+        data = jpeg;
+        mime = 'image/jpeg';
+        ext = 'jpg';
+      }
+    }
+
+    if (data.length > MAX_BYTES) {
+      throw new Error('剪贴板图片太大，无法压缩到 8MB 以内；请截取更小区域或降低分辨率后再试');
+    }
+
+    const dir = path.join(os.tmpdir(), 'mouricode', 'clipboard-images');
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `mc-clip-${Date.now()}-${crypto.randomUUID()}.${ext}`);
+    fs.writeFileSync(filePath, data);
+
+    return { ok: true, filePath, bytes: data.length, mime };
+  });
 
   // --- Task commands ---
   ipcMain.handle(IPC.CreateTask, (_e, args) => {
@@ -117,6 +187,37 @@ export function registerAllHandlers(win: BrowserWindow): void {
     validatePath(args.worktreePath, 'worktreePath');
     validateRelativePath(args.filePath, 'filePath');
     return getFileDiff(args.worktreePath, args.filePath);
+  });
+  ipcMain.handle(IPC.ReadFileAsDataUrl, async (_e, args) => {
+    validatePath(args.filePath, 'filePath');
+
+    // Keep this conservative: only common raster image formats for now.
+    const ext = path.extname(args.filePath).toLowerCase();
+    const mime =
+      ext === '.png'
+        ? 'image/png'
+        : ext === '.jpg' || ext === '.jpeg'
+          ? 'image/jpeg'
+          : ext === '.gif'
+            ? 'image/gif'
+            : ext === '.webp'
+              ? 'image/webp'
+              : null;
+    if (!mime) throw new Error(`Unsupported preview format: ${ext || '(no extension)'}`);
+
+    const stat = await fs.promises.stat(args.filePath);
+    if (!stat.isFile()) throw new Error('Path is not a file');
+
+    const MAX_BYTES = 12 * 1024 * 1024; // 12MB
+    if (stat.size > MAX_BYTES) throw new Error('File too large to preview');
+
+    const buf = await fs.promises.readFile(args.filePath);
+    const base64 = buf.toString('base64');
+    return {
+      mime,
+      bytes: buf.length,
+      data_url: `data:${mime};base64,${base64}`,
+    };
   });
   ipcMain.handle(IPC.GetGitignoredDirs, (_e, args) => {
     validatePath(args.projectRoot, 'projectRoot');

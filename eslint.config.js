@@ -10,6 +10,7 @@ export default [
     ignores: [
       'dist/**',
       'dist-electron/**',
+      'dist-remote/**',
       'release/**',
       'node_modules/**',
       // Build config excluded from electron tsconfig; not worth linting separately
@@ -105,6 +106,20 @@ export default [
     },
     rules: {
       '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+
+  // Node ESM files (integrations): expose Node 18+ web globals used by plugins.
+  {
+    files: ['integrations/**/*.js'],
+    languageOptions: {
+      globals: {
+        URL: 'readonly',
+        AbortController: 'readonly',
+        fetch: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+      },
     },
   },
 

@@ -1,4 +1,4 @@
-import { Show, createSignal, createEffect } from 'solid-js';
+import { Show, createSignal, createEffect, onCleanup } from 'solid-js';
 import { Dialog } from './Dialog';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
@@ -7,7 +7,7 @@ import '@git-diff-view/solid/styles/diff-view.css';
 import { theme } from '../lib/theme';
 import { isBinaryDiff } from '../lib/diff-parser';
 import { getStatusColor } from '../lib/status-colors';
-import type { ChangedFile } from '../ipc/types';
+import type { ChangedFile, FileDataUrl } from '../ipc/types';
 
 interface DiffViewerDialogProps {
   file: ChangedFile | null;
@@ -66,35 +66,81 @@ function detectLang(filePath: string): string {
   return EXT_TO_LANG[ext] ?? 'plaintext';
 }
 
+function isPreviewableImage(filePath: string): boolean {
+  const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+  return ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'gif' || ext === 'webp';
+}
+
+function joinPosix(base: string, rel: string): string {
+  if (!base) return rel;
+  if (base.endsWith('/')) return base + rel;
+  return `${base}/${rel}`;
+}
+
 export function DiffViewerDialog(props: DiffViewerDialogProps) {
   const [rawDiff, setRawDiff] = createSignal('');
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal('');
   const [binary, setBinary] = createSignal(false);
+  const [previewLoading, setPreviewLoading] = createSignal(false);
+  const [previewError, setPreviewError] = createSignal('');
+  const [preview, setPreview] = createSignal<FileDataUrl | null>(null);
   const [viewMode, setViewMode] = createSignal(DiffModeEnum.Split);
 
   createEffect(() => {
     const file = props.file;
     if (!file) return;
 
+    let cancelled = false;
+    onCleanup(() => {
+      cancelled = true;
+    });
+
     setLoading(true);
     setError('');
     setBinary(false);
     setRawDiff('');
+    setPreviewLoading(false);
+    setPreviewError('');
+    setPreview(null);
 
     invoke<string>(IPC.GetFileDiff, {
       worktreePath: props.worktreePath,
       filePath: file.path,
     })
       .then((raw) => {
+        if (cancelled) return;
         if (isBinaryDiff(raw)) {
           setBinary(true);
+          if (file.status !== 'D' && isPreviewableImage(file.path)) {
+            setPreviewLoading(true);
+            const fullPath = joinPosix(props.worktreePath, file.path);
+            void invoke<FileDataUrl>(IPC.ReadFileAsDataUrl, { filePath: fullPath })
+              .then((result) => {
+                if (cancelled) return;
+                setPreview(result);
+              })
+              .catch((e) => {
+                if (cancelled) return;
+                setPreviewError(e instanceof Error ? e.message : String(e));
+              })
+              .finally(() => {
+                if (cancelled) return;
+                setPreviewLoading(false);
+              });
+          }
         } else {
           setRawDiff(raw);
         }
       })
-      .catch((err) => setError(String(err)))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (cancelled) return;
+        setError(String(err));
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoading(false);
+      });
   });
 
   return (
@@ -236,9 +282,61 @@ export function DiffViewerDialog(props: DiffViewerDialogProps) {
               </Show>
 
               <Show when={binary()}>
-                <div style={{ padding: '40px', 'text-align': 'center', color: theme.fgMuted }}>
-                  二进制文件，无法显示差异
-                </div>
+                <Show
+                  when={props.file && isPreviewableImage(props.file.path)}
+                  fallback={
+                    <div style={{ padding: '40px', 'text-align': 'center', color: theme.fgMuted }}>
+                      二进制文件，无法显示差异
+                    </div>
+                  }
+                >
+                  <div style={{ padding: '18px 20px' }}>
+                    <Show when={props.file?.status === 'D'}>
+                      <div style={{ 'text-align': 'center', color: theme.fgMuted }}>
+                        文件已删除，无法预览
+                      </div>
+                    </Show>
+                    <Show when={props.file?.status !== 'D'}>
+                      <Show when={previewLoading()}>
+                        <div style={{ 'text-align': 'center', color: theme.fgMuted }}>
+                          正在加载图片...
+                        </div>
+                      </Show>
+                      <Show when={previewError()}>
+                        <div style={{ 'text-align': 'center', color: theme.error }}>
+                          {previewError()}
+                        </div>
+                      </Show>
+                      <Show when={!previewLoading() && !previewError() && preview()}>
+                        {(p) => (
+                          <div
+                            style={{
+                              display: 'flex',
+                              'justify-content': 'center',
+                              'align-items': 'center',
+                              padding: '10px',
+                              border: `1px solid ${theme.border}`,
+                              'border-radius': '12px',
+                              background: theme.bgInput,
+                            }}
+                          >
+                            <img
+                              src={p().data_url}
+                              alt={props.file?.path ?? 'image'}
+                              style={{
+                                display: 'block',
+                                'max-width': '100%',
+                                'max-height': 'calc(85vh - 160px)',
+                                'object-fit': 'contain',
+                                'border-radius': '8px',
+                              }}
+                            />
+                          </div>
+                        )}
+                      </Show>
+                    </Show>
+                  </div>
+                </Show>
               </Show>
 
               <Show when={!loading() && !error() && !binary() && !rawDiff()}>

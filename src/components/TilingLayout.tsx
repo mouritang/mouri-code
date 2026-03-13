@@ -15,11 +15,12 @@ export function TilingLayout() {
 
   onMount(() => {
     if (!containerRef) return;
+    const el = containerRef;
     const handleWheel = createCtrlShiftWheelResizeHandler((deltaPx) => {
       panelHandle?.resizeAll(deltaPx);
     });
-    containerRef.addEventListener('wheel', handleWheel, { passive: false });
-    onCleanup(() => containerRef!.removeEventListener('wheel', handleWheel));
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    onCleanup(() => el.removeEventListener('wheel', handleWheel));
   });
 
   // Scroll the active task panel into view when selection changes
@@ -136,17 +137,22 @@ export function TilingLayout() {
                     </div>
                   )}
                 >
-                  {store.tasks[panelId] ? (
-                    <TaskPanel
-                      task={store.tasks[panelId]!}
-                      isActive={store.activeTaskId === panelId}
-                    />
-                  ) : store.terminals[panelId] ? (
-                    <TerminalPanel
-                      terminal={store.terminals[panelId]!}
-                      isActive={store.activeTaskId === panelId}
-                    />
-                  ) : null}
+                  {(() => {
+                    const task = store.tasks[panelId];
+                    if (task) {
+                      return <TaskPanel task={task} isActive={store.activeTaskId === panelId} />;
+                    }
+                    const terminal = store.terminals[panelId];
+                    if (terminal) {
+                      return (
+                        <TerminalPanel
+                          terminal={terminal}
+                          isActive={store.activeTaskId === panelId}
+                        />
+                      );
+                    }
+                    return null;
+                  })()}
                 </ErrorBoundary>
               </div>
             );

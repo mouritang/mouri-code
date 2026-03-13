@@ -109,3 +109,13 @@ export interface CommitResult {
   commit_hash: string;
   branch_name: string;
 }
+
+export interface FileDataUrl {
+  mime: string;
+  bytes: number;
+  data_url: string;
+}
+
+export type SaveClipboardImageResult =
+  | { ok: true; filePath: string; bytes: number; mime: string }
+  | { ok: false; reason?: string };

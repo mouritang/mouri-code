@@ -6,6 +6,7 @@ import {
   DEFAULT_GLOBAL_MONITOR_INTERVAL_SEC,
   DEFAULT_GLOBAL_MONITOR_MODEL,
 } from './monitorDefaults';
+import { DEFAULT_VISION_ENDPOINT, DEFAULT_VISION_MODEL } from './visionDefaults';
 import type { AppStore } from './types';
 
 export const [store, setStore] = createStore<AppStore>({
@@ -69,6 +70,16 @@ export const [store, setStore] = createStore<AppStore>({
     alerts: [],
     taskInsights: [],
     commands: [],
+  },
+  vision: {
+    enabled: false,
+    apiKey: '',
+    endpoint: DEFAULT_VISION_ENDPOINT,
+    model: DEFAULT_VISION_MODEL,
+  },
+  imagePreview: {
+    filePath: null,
+    title: null,
   },
 });
 

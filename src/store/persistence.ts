@@ -12,6 +12,7 @@ import type {
   PersistedTask,
   PersistedWindowState,
   PersistedGlobalMonitorConfig,
+  PersistedVisionConfig,
   Project,
 } from './types';
 import { DEFAULT_TERMINAL_FONT, isTerminalFont } from '../lib/fonts';
@@ -23,6 +24,7 @@ import {
   DEFAULT_GLOBAL_MONITOR_INTERVAL_SEC,
   DEFAULT_GLOBAL_MONITOR_MODEL,
 } from './monitorDefaults';
+import { DEFAULT_VISION_ENDPOINT, DEFAULT_VISION_MODEL } from './visionDefaults';
 
 export async function saveState(): Promise<void> {
   const persisted: PersistedState = {
@@ -42,6 +44,12 @@ export async function saveState(): Promise<void> {
       endpoint: store.globalMonitor.endpoint,
       model: store.globalMonitor.model,
       intervalSec: store.globalMonitor.intervalSec,
+    },
+    vision: {
+      enabled: store.vision.enabled,
+      apiKey: store.vision.apiKey,
+      endpoint: store.vision.endpoint,
+      model: store.vision.model,
     },
     completedTaskDate: store.completedTaskDate,
     completedTaskCount: store.completedTaskCount,
@@ -159,6 +167,31 @@ function parsePersistedGlobalMonitor(v: unknown): PersistedGlobalMonitorConfig {
   };
 }
 
+function parsePersistedVision(v: unknown): PersistedVisionConfig {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    return {
+      enabled: false,
+      apiKey: '',
+      endpoint: DEFAULT_VISION_ENDPOINT,
+      model: DEFAULT_VISION_MODEL,
+    };
+  }
+
+  const raw = v as Record<string, unknown>;
+  return {
+    enabled: raw.enabled === true,
+    apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : '',
+    endpoint:
+      typeof raw.endpoint === 'string' && raw.endpoint.trim().length > 0
+        ? raw.endpoint.trim()
+        : DEFAULT_VISION_ENDPOINT,
+    model:
+      typeof raw.model === 'string' && raw.model.trim().length > 0
+        ? raw.model.trim()
+        : DEFAULT_VISION_MODEL,
+  };
+}
+
 interface LegacyPersistedState {
   projectRoot?: string;
   projects?: Project[];
@@ -242,6 +275,11 @@ export async function loadState(): Promise<void> {
       s.globalMonitor.endpoint = persistedGlobalMonitor.endpoint;
       s.globalMonitor.model = persistedGlobalMonitor.model;
       s.globalMonitor.intervalSec = persistedGlobalMonitor.intervalSec;
+      const persistedVision = parsePersistedVision(rawAny.vision);
+      s.vision.enabled = persistedVision.enabled;
+      s.vision.apiKey = persistedVision.apiKey;
+      s.vision.endpoint = persistedVision.endpoint;
+      s.vision.model = persistedVision.model;
       const completedTaskDate =
         typeof rawAny.completedTaskDate === 'string' ? rawAny.completedTaskDate : today;
       const completedTaskCountRaw = rawAny.completedTaskCount;

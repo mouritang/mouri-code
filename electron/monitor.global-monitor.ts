@@ -9,7 +9,6 @@ const MAX_TASKS = 8;
 const MAX_SESSION_CHARS = 2_400;
 const MAX_ALERTS = 3;
 const MAX_TASK_INSIGHTS = 8;
-const MAX_COMMANDS = 3;
 const REQUEST_TIMEOUT_MS = 60_000;
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
@@ -357,39 +356,6 @@ function normalizeTaskInsights(raw: unknown, contexts: TaskContext[]): MonitorTa
     })
     .filter((entry): entry is MonitorTaskInsight => Boolean(entry && entry.taskName))
     .slice(0, MAX_TASK_INSIGHTS);
-}
-
-function normalizeCommands(raw: unknown, contexts: TaskContext[]): MonitorCommand[] {
-  if (!Array.isArray(raw)) return [];
-  const taskByName = new Map(contexts.map((task) => [task.taskName, task]));
-  const taskById = new Map(contexts.map((task) => [task.taskId, task]));
-
-  return raw
-    .map((entry) => {
-      if (!entry || typeof entry !== 'object') return null;
-      const data = entry as Record<string, unknown>;
-      const matchedTask =
-        (typeof data.taskId === 'string' ? taskById.get(data.taskId) : undefined) ??
-        (typeof data.taskName === 'string' ? taskByName.get(data.taskName) : undefined) ??
-        null;
-      const taskId = matchedTask?.taskId ?? (typeof data.taskId === 'string' ? data.taskId : '');
-      const fallbackTaskName = taskId || '未命名任务';
-      const taskName =
-        matchedTask?.taskName ??
-        truncateText(data.taskName, fallbackTaskName, 80) ??
-        fallbackTaskName;
-      const prompt = truncateText(data.prompt, '', 260);
-      if (!prompt) return null;
-
-      return {
-        taskId,
-        taskName,
-        prompt,
-        rationale: truncateText(data.rationale, '建议助手主动推动该任务继续前进。', 180),
-      } satisfies MonitorCommand;
-    })
-    .filter((entry): entry is MonitorCommand => Boolean(entry && entry.taskId && entry.prompt))
-    .slice(0, MAX_COMMANDS);
 }
 
 function buildPrompt(contexts: TaskContext[]): { system: string; user: string } {

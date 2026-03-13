@@ -99,6 +99,7 @@ export interface PersistedState {
   lastProjectId: string | null;
   lastAgentId: string | null;
   globalMonitor?: PersistedGlobalMonitorConfig;
+  vision?: PersistedVisionConfig;
   taskOrder: string[];
   tasks: Record<string, PersistedTask>;
   terminals?: Record<string, PersistedTerminal>;
@@ -145,12 +146,24 @@ export interface PersistedGlobalMonitorConfig {
   intervalSec: number;
 }
 
+export interface PersistedVisionConfig {
+  enabled: boolean;
+  apiKey: string;
+  endpoint: string;
+  model: string;
+}
+
 export interface GlobalMonitorState extends GlobalMonitorSnapshot {
   apiKey: string;
   alerts: GlobalMonitorAlert[];
   taskInsights: GlobalMonitorTaskInsight[];
   commands: GlobalMonitorCommand[];
   status: GlobalMonitorStatus;
+}
+
+export interface ImagePreviewState {
+  filePath: string | null;
+  title: string | null;
 }
 
 export interface AppStore {
@@ -192,4 +205,6 @@ export interface AppStore {
   newTaskDropUrl: string | null;
   remoteAccess: RemoteAccess;
   globalMonitor: GlobalMonitorState;
+  vision: PersistedVisionConfig;
+  imagePreview: ImagePreviewState;
 }

@@ -12,6 +12,8 @@ export enum IPC {
   UpdateGlobalMonitorConfig = 'update_global_monitor_config',
   GetGlobalMonitorStatus = 'get_global_monitor_status',
   RunGlobalMonitorNow = 'run_global_monitor_now',
+  VisionDescribeImages = 'vision_describe_images',
+  SaveClipboardImage = 'save_clipboard_image',
 
   // Task
   CreateTask = 'create_task',
@@ -20,6 +22,7 @@ export enum IPC {
   // Git
   GetChangedFiles = 'get_changed_files',
   GetFileDiff = 'get_file_diff',
+  ReadFileAsDataUrl = 'read_file_as_data_url',
   GetGitignoredDirs = 'get_gitignored_dirs',
   GetWorktreeStatus = 'get_worktree_status',
   CheckMergeStatus = 'check_merge_status',

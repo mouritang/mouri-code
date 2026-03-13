@@ -15,6 +15,10 @@ import {
   setThemePreset,
   setAutoTrustFolders,
   setInactiveColumnOpacity,
+  setVisionApiKey,
+  setVisionEnabled,
+  setVisionEndpoint,
+  setVisionModel,
 } from '../store/store';
 import { mod } from '../lib/platform';
 import type { TerminalFont } from '../lib/fonts';
@@ -166,6 +170,100 @@ export function SettingsDialog(props: SettingsDialogProps) {
               </button>
             )}
           </For>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', 'flex-direction': 'column', gap: '10px' }}>
+        <div
+          style={{
+            'font-size': '11px',
+            color: theme.fgMuted,
+            'text-transform': 'uppercase',
+            'letter-spacing': '0.05em',
+            'font-weight': '600',
+          }}
+        >
+          图片（Vision）
+        </div>
+
+        <label
+          style={{
+            display: 'flex',
+            'align-items': 'center',
+            gap: '10px',
+            cursor: 'pointer',
+            padding: '8px 12px',
+            'border-radius': '8px',
+            background: theme.bgInput,
+            border: `1px solid ${theme.border}`,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={store.vision.enabled}
+            onChange={(e) => setVisionEnabled(e.currentTarget.checked)}
+            style={{ 'accent-color': theme.accent, cursor: 'pointer' }}
+          />
+          <div style={{ display: 'flex', 'flex-direction': 'column', gap: '2px', flex: 1 }}>
+            <span style={{ 'font-size': '13px', color: theme.fg }}>启用图片解析并转成文字</span>
+            <span style={{ 'font-size': '11px', color: theme.fgSubtle }}>
+              用于在“全局助理 →
+              发送指令”里附加图片时，先用视觉模型把图片内容转成可复制文本，再发送到任务终端的 CLI。
+            </span>
+          </div>
+        </label>
+
+        <div
+          style={{
+            display: 'grid',
+            'grid-template-columns': '1fr',
+            gap: '10px',
+          }}
+        >
+          <div style={{ display: 'flex', 'flex-direction': 'column', gap: '6px' }}>
+            <span style={{ 'font-size': '12px', color: theme.fg }}>OpenAI API Key</span>
+            <input
+              type="password"
+              value={store.vision.apiKey}
+              onInput={(e) => setVisionApiKey(e.currentTarget.value)}
+              placeholder="sk-..."
+              style={inputStyle}
+            />
+            <span style={{ 'font-size': '11px', color: theme.fgSubtle }}>
+              仅保存在本机应用状态中，也支持通过环境变量 `OPENAI_API_KEY`
+              提供（未填写时会尝试读取）。
+            </span>
+          </div>
+        </div>
+
+        <div
+          style={{
+            display: 'grid',
+            'grid-template-columns': '1fr 1fr',
+            gap: '10px',
+          }}
+        >
+          <div style={{ display: 'flex', 'flex-direction': 'column', gap: '6px' }}>
+            <span style={{ 'font-size': '12px', color: theme.fg }}>模型</span>
+            <input
+              type="text"
+              value={store.vision.model}
+              onInput={(e) => setVisionModel(e.currentTarget.value)}
+              placeholder="gpt-4o-mini"
+              style={inputStyle}
+            />
+          </div>
+
+          <div style={{ display: 'flex', 'flex-direction': 'column', gap: '6px' }}>
+            <span style={{ 'font-size': '12px', color: theme.fg }}>API Endpoint</span>
+            <input
+              type="text"
+              value={store.vision.endpoint}
+              onInput={(e) => setVisionEndpoint(e.currentTarget.value)}
+              placeholder="https://api.openai.com/v1/chat/completions"
+              style={inputStyle}
+            />
+          </div>
         </div>
       </div>
 

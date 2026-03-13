@@ -17,12 +17,15 @@ const ALLOWED_CHANNELS = new Set([
   'update_global_monitor_config',
   'get_global_monitor_status',
   'run_global_monitor_now',
+  'vision_describe_images',
+  'save_clipboard_image',
   // Task
   'create_task',
   'delete_task',
   // Git
   'get_changed_files',
   'get_file_diff',
+  'read_file_as_data_url',
   'get_gitignored_dirs',
   'get_worktree_status',
   'check_merge_status',

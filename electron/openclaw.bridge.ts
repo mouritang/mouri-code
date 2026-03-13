@@ -215,7 +215,7 @@ async function sendPromptToTask(
   };
 }
 
-function jsonHeaders(statusCode = 200): Record<string, string | number> {
+function jsonHeaders(_statusCode = 200): Record<string, string | number> {
   return {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -438,7 +438,7 @@ export function startOpenClawBridge(options: OpenClawBridgeOptions): OpenClawBri
       baseUrl = `http://${DEFAULT_HOST}:${port}`;
       lastError = null;
       await publishDiscoveryFile(baseUrl, port);
-      console.info(`[openclaw-bridge] listening on ${baseUrl}`);
+      console.warn(`[openclaw-bridge] listening on ${baseUrl}`);
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
       console.error('[openclaw-bridge] failed to start:', lastError);
